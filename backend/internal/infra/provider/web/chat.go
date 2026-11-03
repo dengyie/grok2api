@@ -231,18 +231,24 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if input.ParallelToolCalls != nil {
 		parallelTools = *input.ParallelToolCalls
 	}
-	if modelKnown && spec.Capability == modeldomain.CapabilityImage {
-		if len(tools.ResponseTools) > 0 {
-			return invalidImageRequest("图片生成模型不支持 tools")
+		if modelKnown && spec.Capability == modeldomain.CapabilityImage {
+			if len(tools.ResponseTools) > 0 {
+				return invalidImageRequest("图片生成模型不支持 tools")
+			}
+			return a.forwardImageChatCompletion(ctx, request, input, normalized, spec)
 		}
-		return a.forwardImageChatCompletion(ctx, request, input, normalized, spec)
-	}
-	if modelKnown && spec.Capability == modeldomain.CapabilityImageEdit {
-		return invalidImageRequest("图片编辑模型请使用 /v1/images/edits，并在当前请求中显式提供输入图片")
-	}
-	if !modelKnown || spec.Capability != modeldomain.CapabilityChat {
-		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "模型不支持文本对话", "type": "invalid_request_error"}}), nil
-	}
+		if modelKnown && spec.Capability == modeldomain.CapabilityImageEdit {
+			return invalidImageRequest("图片编辑模型请使用 /v1/images/edits，并在当前请求中显式提供输入图片")
+		}
+		if modelKnown && spec.Capability == modeldomain.CapabilityVideo {
+			if len(tools.ResponseTools) > 0 {
+				return invalidImageRequest("视频生成模型不支持 tools")
+			}
+			return a.forwardVideoChatCompletion(ctx, request, input, normalized, spec)
+		}
+		if !modelKnown || spec.Capability != modeldomain.CapabilityChat {
+			return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "模型不支持文本对话", "type": "invalid_request_error"}}), nil
+		}
 
 	normalized.Prompt = injectToolPrompt(normalized.Prompt, tools)
 	responseID := newWebID("resp")

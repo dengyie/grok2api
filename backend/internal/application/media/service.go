@@ -249,6 +249,11 @@ func (s *Service) PublicImageURL(id string) string {
 	return s.runtimeConfig().PublicBaseURL + "/v1/media/images/" + id
 }
 
+// PublicVideoURL 返回可直接用于视频播放的公开资源地址。
+func (s *Service) PublicVideoURL(id string) string {
+	return s.runtimeConfig().PublicBaseURL + "/v1/media/videos/" + id
+}
+
 // OpenImage 读取图片元数据和正文，不向调用方暴露实际文件路径。
 func (s *Service) OpenImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error) {
 	asset, err := s.assets.GetMediaAsset(ctx, strings.TrimSpace(id))

@@ -91,11 +91,13 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/messages", h.createMessage)
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
-	router.POST("/videos/generations", h.generateVideo)
-	router.POST("/videos/edits", h.editVideo)
+		router.POST("/videos/generations", h.generateVideo)
+		router.POST("/videos", h.generateVideo)
+		router.POST("/videos/edits", h.editVideo)
 	router.POST("/videos/extensions", h.extendVideo)
 	router.GET("/videos/:requestId", h.getVideo)
 	router.GET("/videos/:requestId/content", h.getVideoContent)
+	router.HEAD("/videos/:requestId/content", h.getVideoContent)
 	router.POST("/tts", h.synthesizeSpeech)
 	router.GET("/tts/voices", h.listTTSVoices)
 	router.GET("/tts/voices/:voiceId", h.getTTSVoice)
@@ -916,7 +918,7 @@ func (h *Handler) handleVideoCreate(c *gin.Context, operation, label string) {
 		writeGatewayError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+		c.JSON(http.StatusOK, gin.H{"request_id": job.ID, "id": job.ID, "task_id": job.ID})
 }
 
 func (h *Handler) getVideo(c *gin.Context) {
@@ -1098,16 +1100,21 @@ func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
 			video["duration"] = job.Seconds
 		}
 		return gin.H{
-			"status": "done", "model": job.Model, "progress": 100,
+			"id": job.ID, "task_id": job.ID, "request_id": job.ID,
+			"status": "completed", "state": "done", "model": job.Model, "progress": 100,
 			"video": video,
 		}
 	case mediadomain.StatusFailed:
 		return gin.H{
+			"id": job.ID, "task_id": job.ID, "request_id": job.ID,
 			"status": "failed",
 			"error":  gin.H{"code": officialVideoErrorCode(job.ErrorCode), "message": job.ErrorMessage},
 		}
 	default:
-		return gin.H{"status": "pending", "model": job.Model, "progress": min(99, max(0, job.Progress))}
+		return gin.H{
+			"id": job.ID, "task_id": job.ID, "request_id": job.ID,
+			"status": "pending", "model": job.Model, "progress": min(99, max(0, job.Progress)),
+		}
 	}
 }
 

@@ -828,6 +828,12 @@ type ImageAssetStore interface {
 	PublicImageURL(id string) string
 }
 
+// VideoAssetStore archives generated videos as local resources and provides public playback URLs.
+type VideoAssetStore interface {
+	SaveVideo(ctx context.Context, jobID, contentType string, body io.Reader) (media.Asset, error)
+	PublicVideoURL(id string) string
+}
+
 type VideoAdapter interface {
 	Adapter
 	GenerateVideo(ctx context.Context, request VideoRequest) (VideoResult, error)

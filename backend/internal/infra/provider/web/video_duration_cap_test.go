@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -109,5 +110,126 @@ func TestGenerateVideoCapsBasicCredentialBeforeUpstream(t *testing.T) {
 	}
 	if requestCount != 1 {
 		t.Fatalf("out-of-range duration reached upstream; request count = %d, want 1", requestCount)
+	}
+}
+
+type testVideoAssetStore struct {
+	saved []byte
+}
+
+func (s *testVideoAssetStore) SaveImage(_ context.Context, _ []byte) (mediadomain.Asset, error) {
+	return mediadomain.Asset{}, nil
+}
+func (s *testVideoAssetStore) PublicImageURL(id string) string { return "" }
+func (s *testVideoAssetStore) SaveVideo(_ context.Context, jobID, contentType string, body io.Reader) (mediadomain.Asset, error) {
+	data, _ := io.ReadAll(body)
+	s.saved = data
+	return mediadomain.Asset{ID: "vid_123", Kind: "video", MIMEType: "video/mp4"}, nil
+}
+func (s *testVideoAssetStore) PublicVideoURL(id string) string {
+	return "https://api.example.com/v1/media/videos/" + id
+}
+
+func TestForwardVideoChatCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/rest/app-chat/conversations/new" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post_1","videoUrl":"/videos/final.mp4"}}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedToken, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &testVideoAssetStore{}
+	adapter := NewAdapter(Config{
+		BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: "test",
+		VideoTimeoutSeconds: 5, FreeVideoDurationCap: 6,
+	}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, store)
+
+	credential := account.Credential{
+		ID: 1, Provider: account.ProviderWeb, WebTier: account.WebTierBasic,
+		EncryptedAccessToken: encryptedToken,
+	}
+
+	// 1. Test Chat Completion (OpenAI / Google Chat format)
+	chatBody, _ := json.Marshal(map[string]any{
+		"model": "grok-imagine-video",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "generate a cat video"},
+		},
+	})
+	chatResp, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: credential,
+		Method:     http.MethodPost,
+		Path:       "/responses",
+		Body:       chatBody,
+		Model:      "grok-imagine-video",
+		Operation:  "chat",
+	})
+	if err != nil {
+		t.Fatalf("ForwardResponse chat failed: %v", err)
+	}
+	defer chatResp.Body.Close()
+	var chatResult struct {
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(chatResp.Body).Decode(&chatResult); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	if len(chatResult.Choices) == 0 || chatResult.Choices[0].Message.Content == "" {
+		t.Fatalf("unexpected chat response: %#v", chatResult)
+	}
+	if want := "[video](https://assets.grok.com/videos/final.mp4)"; chatResult.Choices[0].Message.Content != want {
+		t.Fatalf("chat content = %q, want %q", chatResult.Choices[0].Message.Content, want)
+	}
+
+		// 2. Test Messages (Claude format)
+		messagesBody, _ := json.Marshal(map[string]any{
+			"model":      "grok-imagine-video",
+			"max_tokens": 1024,
+			"messages": []any{
+				map[string]any{"role": "user", "content": "generate a dog video"},
+			},
+		})
+	msgResp, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: credential,
+		Method:     http.MethodPost,
+		Path:       "/responses",
+		Body:       messagesBody,
+		Model:      "grok-imagine-video",
+		Operation:  "messages",
+	})
+	if err != nil {
+		t.Fatalf("ForwardResponse messages failed: %v", err)
+	}
+	defer msgResp.Body.Close()
+	var msgResult struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.NewDecoder(msgResp.Body).Decode(&msgResult); err != nil {
+		t.Fatalf("decode messages response: %v", err)
+	}
+	if len(msgResult.Content) == 0 || msgResult.Content[0].Text == "" {
+		t.Fatalf("unexpected messages response: %#v", msgResult)
+	}
+	if want := "[video](https://assets.grok.com/videos/final.mp4)"; msgResult.Content[0].Text != want {
+		t.Fatalf("messages text = %q, want %q", msgResult.Content[0].Text, want)
 	}
 }

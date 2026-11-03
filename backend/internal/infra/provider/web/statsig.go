@@ -424,6 +424,9 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 	}
 	cfg := a.config()
 	request.Header.Del("x-statsig-id")
+	if cfg.StatsigMode == "disabled" || cfg.StatsigMode == "off" || cfg.StatsigMode == "none" || cfg.StatsigMode == "" {
+		return
+	}
 	if cfg.StatsigMode == "manual" {
 		if value := strings.TrimSpace(cfg.StatsigManualValue); validStatsigID(value) {
 			request.Header.Set("x-statsig-id", value)
@@ -449,6 +452,9 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 // WarmStatsig 只使用一个 Web 账号和一个出口租约预热共享签名，不会逐账号访问上游。
 func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential) (int, error) {
 	cfg := a.config()
+	if cfg.StatsigMode == "disabled" || cfg.StatsigMode == "off" || cfg.StatsigMode == "none" || cfg.StatsigMode == "" {
+		return 0, nil
+	}
 	if cfg.StatsigMode == "manual" {
 		if !validStatsigID(strings.TrimSpace(cfg.StatsigManualValue)) {
 			return 0, fmt.Errorf("手动 Statsig 配置无效")

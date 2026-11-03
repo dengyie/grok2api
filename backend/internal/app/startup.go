@@ -357,6 +357,14 @@ func (a *Application) runStatsigWarmup(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
+			if a.settings != nil {
+				statsigMode := a.settings.Get().Config.ProviderWeb.StatsigMode
+				if statsigMode == "disabled" || statsigMode == "off" || statsigMode == "none" || statsigMode == "" {
+					a.startup.setStatsig("disabled", "Statsig 签名已停用", 0)
+					resetTimer(timer, statsigWarmupInterval)
+					continue
+				}
+			}
 		a.startup.setStatsig("warming", "正在预热共享签名", 0)
 		values, err := a.accountRepo.ListEnabled(ctx, accountdomain.ProviderWeb)
 		if err == nil && len(values) == 0 {

@@ -728,6 +728,14 @@ func routeTargetSeed(input Input) string {
 	return strconv.FormatUint(input.ClientKey.ID, 10) + ":" + anchor
 }
 
+func (s *Service) conversationQuotaMode(route modeldomain.Route) string {
+	catalogMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
+	if route.Provider == accountdomain.ProviderWeb && route.Capability == modeldomain.CapabilityVideo {
+		return videoQuotaMode(route.Provider, catalogMode, "")
+	}
+	return catalogMode
+}
+
 // selectMediaRoute selects a same-name route that satisfies media capability, key permissions, and Provider support.
 func (s *Service) selectMediaRoute(routes []modeldomain.Route, key clientkey.Key, capability modeldomain.Capability, providerSupported func(accountdomain.Provider) bool) (modeldomain.Route, error) {
 	eligible, fallback, err := s.eligibleMediaRoutes(routes, key, capability, providerSupported)
@@ -907,17 +915,17 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				identity = ensureBuildComposerSessionIdentity(identity, input.ClientKey.ID, candidate.Provider, candidate.UpstreamModel, requestSessionScope)
 				affinityKey = identity.affinityKey
 			}
-			candidateSession, selectionErr := s.selector.beginSelectionSessionForKey(
-				ctx,
-				candidate.Provider,
-				candidate.ID,
-				candidate.UpstreamModel,
-				s.providers.QuotaMode(candidate.Provider, candidate.UpstreamModel),
-				affinityKey,
-				nil,
-				true,
-				accountScope,
-			)
+				candidateSession, selectionErr := s.selector.beginSelectionSessionForKey(
+					ctx,
+					candidate.Provider,
+					candidate.ID,
+					candidate.UpstreamModel,
+					s.conversationQuotaMode(candidate),
+					affinityKey,
+					nil,
+					true,
+					accountScope,
+				)
 			if selectionErr != nil {
 				continue
 			}
@@ -1035,11 +1043,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
-	// Count accounts that actually reached the upstream. Credential-only skips
-	// do not consume the quality retry budget; refreshes stay on the same account.
-	qualityAccountAttempts := 0
-	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	quotaProbeAttempted := false
+		// Count accounts that actually reached the upstream. Credential-only skips
+		// do not consume the quality retry budget; refreshes stay on the same account.
+		qualityAccountAttempts := 0
+		quotaMode := s.conversationQuotaMode(route)
+		quotaProbeAttempted := false
 	selection := preselectedSession
 	var lastErr error
 	var lastFailure *UpstreamFailure

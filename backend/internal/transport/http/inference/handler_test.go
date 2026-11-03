@@ -131,11 +131,11 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 		t.Fatalf("wrong content type status=%d body=%s", wrongContentTypeRecorder.Code, wrongContentTypeRecorder.Body.String())
 	}
 
-	unsupportedRecorder := httptest.NewRecorder()
-	router.ServeHTTP(unsupportedRecorder, httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{}`)))
-	if unsupportedRecorder.Code != http.StatusNotFound {
-		t.Fatalf("unsupported video endpoint status=%d", unsupportedRecorder.Code)
-	}
+		unsupportedRecorder := httptest.NewRecorder()
+		router.ServeHTTP(unsupportedRecorder, httptest.NewRequest(http.MethodPost, "/v1/videos/unknown_action", strings.NewReader(`{}`)))
+		if unsupportedRecorder.Code != http.StatusNotFound {
+			t.Fatalf("unsupported video endpoint status=%d", unsupportedRecorder.Code)
+		}
 	contentRecorder := httptest.NewRecorder()
 	router.ServeHTTP(contentRecorder, httptest.NewRequest(http.MethodGet, "/v1/videos/request_1/content", nil))
 	if contentRecorder.Code != http.StatusUnauthorized {
@@ -618,11 +618,11 @@ func TestVideoGenerationResponseMatchesOfficialPollingShape(t *testing.T) {
 	if pending["status"] != "pending" || pending["progress"] != 42 || pending["model"] != "grok-imagine-video" || pending["video"] != nil {
 		t.Fatalf("pending response=%#v", pending)
 	}
-	done := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusCompleted, Progress: 100, Seconds: 8, UpstreamURL: "https://assets.grok.com/video.mp4", CompletedAt: &now})
-	video, ok := done["video"].(gin.H)
-	if done["status"] != "done" || done["progress"] != 100 || !ok || video["url"] != "https://assets.grok.com/video.mp4" || video["duration"] != 8 || video["respect_moderation"] != true {
-		t.Fatalf("done response=%#v", done)
-	}
+		done := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusCompleted, Progress: 100, Seconds: 8, UpstreamURL: "https://assets.grok.com/video.mp4", CompletedAt: &now})
+		video, ok := done["video"].(gin.H)
+		if done["status"] != "completed" || done["state"] != "done" || done["progress"] != 100 || !ok || video["url"] != "https://assets.grok.com/video.mp4" || video["duration"] != 8 || video["respect_moderation"] != true {
+			t.Fatalf("done response=%#v", done)
+		}
 	extended := videoGenerationResponse(mediadomain.Job{Operation: mediadomain.VideoOperationExtend, Status: mediadomain.StatusCompleted, Seconds: 6, UpstreamURL: "https://assets.grok.com/extended.mp4"})
 	extendedVideo, ok := extended["video"].(gin.H)
 	if !ok || extendedVideo["duration"] != nil {

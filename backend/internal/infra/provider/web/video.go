@@ -2,6 +2,7 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -564,6 +565,86 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 				"resolutionName": resolution,
 			},
 		},
-		"kind": "CONVERSATION_KIND_IMAGINE",
+			"kind": "CONVERSATION_KIND_IMAGINE",
+		}
 	}
+
+func (a *Adapter) forwardVideoChatCompletion(ctx context.Context, request provider.ResponseResourceRequest, input openAIRequest, normalized normalizedChatInput, spec ModelSpec) (*provider.Response, error) {
+	if len(normalized.Attachments) > 0 {
+		return invalidImageRequest("文生视频模型只接受当前用户消息中的纯文本；图生视频当前暂未开放")
+	}
+	if strings.TrimSpace(normalized.Prompt) == "" {
+		return invalidImageRequest("视频生成提示词不能为空")
+	}
+	duration := 6
+	aspectRatio := ""
+	resolution := "720p"
+	if input.ImageConfig != nil {
+		if input.ImageConfig.AspectRatio != "" {
+			aspectRatio = input.ImageConfig.AspectRatio
+		}
+		if input.ImageConfig.Resolution != "" {
+			resolution = input.ImageConfig.Resolution
+		}
+	}
+	result, err := a.GenerateVideo(ctx, provider.VideoRequest{
+		Credential:  request.Credential,
+		Model:       request.Model,
+		Prompt:      normalized.Prompt,
+		Duration:    duration,
+		AspectRatio: aspectRatio,
+		Resolution:  resolution,
+	})
+		if err != nil {
+			return nil, err
+		}
+	if result.URL == "" {
+		return nil, fmt.Errorf("视频生成完成但没有返回内容 URL")
+	}
+
+	videoURL := result.URL
+	if videoStore, ok := a.assets.(provider.VideoAssetStore); ok && videoStore != nil {
+		body, contentType, _, downloadErr := a.DownloadVideo(ctx, request.Credential, result.URL)
+		if downloadErr == nil {
+			asset, saveErr := videoStore.SaveVideo(ctx, "", contentType, body)
+			_ = body.Close()
+			if saveErr == nil {
+				videoURL = videoStore.PublicVideoURL(asset.ID)
+			}
+		}
+	}
+
+	responseID := newWebID("resp")
+	parsed := parsedChat{
+		ResponseID:  responseID,
+		InputTokens: estimateTokens(normalized.Prompt),
+	}
+	parsed.appendText("[video](" + videoURL + ")")
+
+	if input.Stream || request.Streaming {
+		stream, err := buildImageCompatibilityStream(request.Operation, responseID, input.Model, &parsed)
+		if err != nil {
+			return nil, err
+		}
+		return &provider.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     streamHeaders(),
+			Body:       io.NopCloser(bytes.NewReader(stream)),
+			QuotaUnits: 1,
+		}, nil
+	}
+
+	payload := buildOpenAIResult(request.Operation, responseID, input.Model, parsed, false)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     jsonHeaders(),
+		Body:       io.NopCloser(bytes.NewReader(data)),
+		QuotaUnits: 1,
+	}, nil
 }
