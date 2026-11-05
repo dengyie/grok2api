@@ -252,8 +252,8 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
+	if len(request.ReferenceURLs) > 0 {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 仅支持文本或单张首帧生视频；多参考图请使用 Build 或 Console Provider"))
 	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
@@ -276,6 +276,28 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		resolution = "720p"
 	}
 	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
+	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
+		image, err := a.loadChatImage(ctx, lease, imageURL, cfg.MaxInputImageBytes)
+		if err != nil {
+			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+		}
+		uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_first_frame_upload")
+		if err != nil {
+			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
+		}
+		if uploaded.MetadataID == "" {
+			return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("上传首帧成功但上游未返回 fileMetadataId"))
+		}
+		// Imagine imageToVideo references fileMetadataId, not fileId/uploadId.
+		// Preparation failure must never fall back to unreferenced text video.
+		payload["mediaGenInput"] = map[string]any{
+			"imageToVideo": map[string]any{
+				"prompt": request.Prompt, "aspectRatio": ratio, "duration": segments[0],
+				"resolutionName": resolution, "skipAudio": true, "mode": "custom",
+				"inputAssets": []string{uploaded.MetadataID},
+			},
+		}
+	}
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
@@ -565,9 +587,9 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 				"resolutionName": resolution,
 			},
 		},
-			"kind": "CONVERSATION_KIND_IMAGINE",
-		}
+		"kind": "CONVERSATION_KIND_IMAGINE",
 	}
+}
 
 func (a *Adapter) forwardVideoChatCompletion(ctx context.Context, request provider.ResponseResourceRequest, input openAIRequest, normalized normalizedChatInput, spec ModelSpec) (*provider.Response, error) {
 	if len(normalized.Attachments) > 0 {
@@ -595,9 +617,9 @@ func (a *Adapter) forwardVideoChatCompletion(ctx context.Context, request provid
 		AspectRatio: aspectRatio,
 		Resolution:  resolution,
 	})
-		if err != nil {
-			return nil, err
-		}
+	if err != nil {
+		return nil, err
+	}
 	if result.URL == "" {
 		return nil, fmt.Errorf("视频生成完成但没有返回内容 URL")
 	}
