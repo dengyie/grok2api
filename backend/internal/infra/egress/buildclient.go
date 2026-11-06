@@ -53,9 +53,17 @@ func newBuildClientWithOptions(proxyURL string, responseHeaderTimeout time.Durat
 		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https":
-			transport.Proxy = http.ProxyURL(parsed)
+			if IsMeshAddr(parsed.Host) {
+				dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)
+				if err != nil {
+					return nil, fmt.Errorf("创建 Grok Build HTTP mesh 代理: %w", err)
+				}
+				transport.DialContext = dialContext(dialer)
+			} else {
+				transport.Proxy = http.ProxyURL(parsed)
+			}
 		case "socks4", "socks4a", "socks5", "socks5h":
-			dialer, err := xproxy.FromURL(parsed, direct)
+			dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)
 			if err != nil {
 				return nil, fmt.Errorf("创建 Grok Build SOCKS 代理: %w", err)
 			}

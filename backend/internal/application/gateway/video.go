@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -26,14 +28,34 @@ import (
 )
 
 const (
-	videoJobTimeout          = 2 * time.Hour
-	videoJobLease            = videoJobTimeout + 5*time.Minute
+	videoJobTimeout = 2 * time.Hour
+	// videoJobMaxAge 是任务从创建起的绝对存活上限。旧实现只有租约兜底（2h5m），
+	// 上游限流时 worker 会在任务内无限重试，5 个 worker 全被占满、期间无法生图生视频。
+	videoJobMaxAge = 30 * time.Minute
+	// videoJobLease 短于任务上限：worker 需靠心跳续租，进程卡死或被杀时租约很快过期。
+	videoJobLease            = 5 * time.Minute
+	videoJobHeartbeat        = 60 * time.Second
 	videoJobRecoveryInterval = 30 * time.Second
-	videoOutputAttempts      = 3
+	// videoJobAbandonAfter 是客户端停止轮询多久后判定为孤儿任务。
+	videoJobAbandonAfter = 10 * time.Minute
+	// videoJobPollTouchInterval 是 last_polled_at 的写入节流间隔。
+	videoJobPollTouchInterval = 30 * time.Second
+	// videoRetryBudget 限制同一任务创建阶段的累计重试耗时，避免 429 触发的重试风暴。
+	videoRetryBudget      = 5 * time.Minute
+	videoRetryBackoffBase = 500 * time.Millisecond
+	videoRetryBackoffMax  = 10 * time.Second
+	// videoSameFailureBreak 表示连续同类失败达到该次数即熔断：上游整体限流时继续换账号
+	// 只会放大约束，不再空转到 attempt 上限。
+	videoSameFailureBreak = 5
+	// videoMaxDefers 限制延迟重投次数，避免"输入槽位不足"反复入队形成的延迟循环。
+	videoMaxDefers      = 10
+	videoOutputAttempts = 3
 	// Base64 物化会同时持有原图和编码后字符串，单独限流避免高 mediaConcurrency 放大内存峰值。
 	videoInputMaterializeConcurrency = 4
 	videoInputJSONBaseBytes          = int64(len(`{"image_urls":[]}`))
 )
+
+var errVideoJobExpired = errors.New("视频任务已超过最大存活时间")
 
 // VideoInputFileReference 将本地临时 file_id 编码为只在 Gateway 内部解释的引用。
 func VideoInputFileReference(fileID string) string {
@@ -298,7 +320,30 @@ func (s *Service) getVideoJob(ctx context.Context, id string, key clientkey.Key)
 	if err != nil {
 		return media.Job{}, ErrResponseNotFound
 	}
+	s.touchVideoJobPolled(ctx, job)
 	return job, nil
+}
+
+// touchVideoJobPolled 记录客户端最后一次查询时间，作为孤儿任务回收的活性信号。
+// 只有非终态任务需要打点；同一任务 30s 内重复轮询不再写库，避免高频轮询把
+// SQLite 单写者通道占满。判定窗口（10min）远大于该节流间隔，精度足够。
+func (s *Service) touchVideoJobPolled(ctx context.Context, job media.Job) {
+	if s.mediaJobs == nil || (job.Status != media.StatusQueued && job.Status != media.StatusInProgress) {
+		return
+	}
+	now := time.Now().UTC()
+	if job.LastPolledAt != nil && now.Sub(*job.LastPolledAt) < videoJobPollTouchInterval {
+		return
+	}
+	touchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := s.mediaJobs.TouchMediaJobPolled(touchCtx, job.ID, now); err != nil {
+		logger := s.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("video_job_poll_touch_failed", "job_id", job.ID, "error", err)
+	}
 }
 
 // GetVideo returns the client-facing job state. A result asset is exposed only
@@ -366,6 +411,11 @@ func (s *Service) RecoverVideoJobs(ctx context.Context) error {
 	if s.mediaJobs == nil {
 		return nil
 	}
+	// 先回收僵尸任务再重投：清空 claim_token 可让仍在运行的旧 worker 后续写入
+	// 因围栏失败而作废，否则它会把刚被置为 failed 的任务改回 in_progress。
+	if err := s.reapVideoJobs(ctx); err != nil {
+		s.logger.Warn("video_job_reap_failed", "error", err)
+	}
 	usageErr := s.reconcileVideoUsage(ctx)
 	values, err := s.mediaJobs.ListRecoverableMediaJobs(ctx, 1000)
 	if err != nil {
@@ -377,6 +427,24 @@ func (s *Service) RecoverVideoJobs(ctx context.Context) error {
 		}
 	}
 	return usageErr
+}
+
+// reapVideoJobs 终结超龄任务与客户端已停止轮询的孤儿任务。
+func (s *Service) reapVideoJobs(ctx context.Context) error {
+	reapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	reaped, err := s.mediaJobs.ReapStaleMediaJobs(reapCtx, time.Now().UTC(), videoJobMaxAge, videoJobAbandonAfter)
+	if err != nil {
+		return err
+	}
+	if reaped > 0 {
+		logger := s.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("video_jobs_reaped", "count", reaped, "max_age", videoJobMaxAge.String(), "abandon_after", videoJobAbandonAfter.String())
+	}
+	return nil
 }
 
 // RunVideoWorkers 使用固定 Worker 处理持久化任务，避免突发请求按任务创建无界 goroutine。
@@ -488,9 +556,65 @@ func (s *Service) claimVideoJob(ctx context.Context, id string) (media.Job, bool
 	return s.mediaJobs.TryClaimMediaJob(ctx, id, now, now.Add(videoJobLease), claimToken)
 }
 
+// startVideoHeartbeat 以 claim_token 围栏续租。只有仍持有所有权的 worker 才能续租，
+// 失去所有权时回调 onLost 并立即退出，避免与回收方/新 owner 争抢同一任务。
+func (s *Service) startVideoHeartbeat(job media.Job, onLost func()) func() {
+	stopCh, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(videoJobHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				now := time.Now().UTC()
+				renewCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				renewed, err := s.mediaJobs.RenewMediaJobLease(renewCtx, job.ID, job.ClaimToken, now, now.Add(videoJobLease))
+				cancel()
+				if err != nil {
+					continue
+				}
+				if !renewed {
+					onLost()
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stopCh)
+			<-done
+		})
+	}
+}
+
 func (s *Service) runVideoJob(parent context.Context, job media.Job, route model.Route) {
-	ctx, cancel := context.WithTimeout(parent, videoJobTimeout)
+	// 绝对 TTL 以创建时间为基准：无论重启、租约续租还是内部重试，任务都不允许活过该上限。
+	deadline := job.CreatedAt.Add(videoJobMaxAge)
+	if job.CreatedAt.IsZero() {
+		deadline = time.Now().Add(videoJobMaxAge)
+	}
+	if limit := time.Now().Add(videoJobTimeout); limit.Before(deadline) {
+		deadline = limit
+	}
+	if !deadline.After(time.Now()) {
+		s.failVideoJob(parent, job, "expired", errVideoJobExpired, 0, nil)
+		return
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
+	// 心跳与业务上下文解耦：上游调用卡死时仍能续租；一旦续租发现所有权被回收
+	// （client/运维清理或对端接手），立即取消业务上下文停止占用 worker。
+	var ownershipLost atomic.Bool
+	stopHeartbeat := s.startVideoHeartbeat(job, func() {
+		ownershipLost.Store(true)
+		cancel()
+	})
+	defer stopHeartbeat()
 	ctx, egressTrace := infraegress.WithTrace(ctx)
 	startedAt := time.Now()
 	job.Progress = max(job.Progress, 1)
@@ -560,10 +684,48 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	var lease *accountLease
 	var result provider.VideoResult
 	var lastErr error
+	retryStartedAt := time.Now()
+	lastFailureSignature := ""
+	sameFailureStreak := 0
 
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		attemptStarted := time.Now()
 		err = nil
+		if ownershipLost.Load() {
+			s.logger.Warn("video_job_ownership_lost", "job_id", job.ID, "attempt", attempt)
+			return
+		}
+		job.AttemptCount = attempt + 1
+		if attempt > 0 {
+			// 上游整体限流/拒绝时换账号并不改变结果。超预算或连续同类失败即终止，
+			// 而不是按 attempt 上限空转（曾出现 8 分钟 507 次请求、5 个 worker 全被占满）。
+			overBudget := time.Since(retryStartedAt) > videoRetryBudget
+			breakerTripped := sameFailureStreak >= videoSameFailureBreak
+			if overBudget || breakerTripped {
+				code, publicErr, upstreamStatus := videoFailureDisposition(lastErr)
+				s.logger.Warn("video_job_retry_aborted", "job_id", job.ID, "attempts", attempt,
+					"same_failure_streak", sameFailureStreak, "budget_exhausted", overBudget, "breaker_tripped", breakerTripped)
+				s.failVideoJob(parent, job, code, publicErr, upstreamStatus, failureAttempts.snapshot())
+				return
+			}
+			if delay := videoRetryDelay(sameFailureStreak); delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					switch {
+					case ownershipLost.Load():
+						s.logger.Warn("video_job_ownership_lost", "job_id", job.ID, "attempt", attempt)
+					case parent.Err() != nil:
+						s.deferVideoJob(parent, job)
+					default:
+						s.failVideoJob(parent, job, "expired", errVideoJobExpired, 0, failureAttempts.snapshot())
+					}
+					return
+				case <-timer.C:
+				}
+			}
+		}
 		if lease != nil {
 			lease.Release()
 			lease = nil
@@ -647,6 +809,18 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 		lastErr = err
 		captureVideoAttempt(failureAttempts, lease.Credential, attemptStarted, err)
+		// 同类失败连续出现说明是上游/出口整体状态，而不是单账号问题。
+		if signature := videoFailureSignature(err); signature != "" {
+			if signature == lastFailureSignature {
+				sameFailureStreak++
+			} else {
+				lastFailureSignature, sameFailureStreak = signature, 1
+			}
+		}
+		if ownershipLost.Load() {
+			s.logger.Warn("video_job_ownership_lost", "job_id", job.ID, "attempt", attempt)
+			return
+		}
 		if parent.Err() != nil {
 			s.deferVideoJob(parent, job)
 			return
@@ -656,7 +830,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureHandled := false
 		retriableCreate := false
 		stage, hasStage := provider.VideoErrorStage(err)
-		safeCreateFailure := hasStage && stage == provider.VideoStageCreate
+		safeCreateFailure := videoSafeToRetryCreate(stage, hasStage, err)
 		status, hasStatus := provider.ErrorHTTPStatus(err)
 		if errors.Is(err, provider.ErrUnauthorized) {
 			if lease.Credential.AuthType == account.AuthTypeSSO {
@@ -718,17 +892,13 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 
 		// Poll/post-processing failures are bound to the already-created upstream job.
 		if provider.IsMediaPostProcessingError(err) || (hasStage && stage == provider.VideoStagePoll) || !retriableCreate || !attemptPolicy.hasNext(attempt) {
-			failureCode, publicErr := "generation_failed", err
-			upstreamStatus := 0
-			if hasStatus {
-				upstreamStatus = status
-			}
-			if errors.Is(err, provider.ErrUnauthorized) || (hasStatus && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
-				failureCode, publicErr = "provider_unavailable", errors.New("上游服务暂不可用")
-			} else if hasStatus && status == http.StatusTooManyRequests {
-				failureCode = "rate_limited"
-			}
+			failureCode, publicErr, upstreamStatus := videoFailureDisposition(err)
 			s.failVideoJob(parent, job, failureCode, publicErr, upstreamStatus, failureAttempts.snapshot())
+			return
+		}
+		// 自身 deadline 已到（父 ctx 未取消）说明任务寿命耗尽，重试只会空转。
+		if ctx.Err() != nil {
+			s.failVideoJob(parent, job, "expired", errVideoJobExpired, 0, failureAttempts.snapshot())
 			return
 		}
 		// Create-stage failure: switch account according to runtime attempt policy.
@@ -753,6 +923,11 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	applyMediaJobEgress(&job, egressTrace, route.Provider)
 	job.LeaseUntil, job.UpdatedAt, job.CompletedAt = nil, now, &now
+	// 所有权被回收时围栏写入会失败，直接放弃收尾，避免把已判定过期的任务改回成功。
+	if ownershipLost.Load() {
+		s.logger.Warn("video_job_ownership_lost_after_success", "job_id", job.ID)
+		return
+	}
 	if err := s.persistVideoJobWithRetry(parent, job); err != nil {
 		s.logger.Error("video_job_terminal_write_failed", "job_id", job.ID, "error", err)
 		return
@@ -1222,6 +1397,87 @@ func videoInputReferences(imageURL string, referenceURLs []string) []string {
 	return values
 }
 
+// videoFailureDisposition 统一推导任务失败时的错误码、对外文案与上游状态码，
+// 供"重试预算耗尽""熔断"与常规失败路径共用，避免两处判定漂移。
+func videoFailureDisposition(err error) (string, error, int) {
+	if err == nil {
+		return "generation_failed", errors.New("视频生成失败"), 0
+	}
+	status, hasStatus := provider.ErrorHTTPStatus(err)
+	upstreamStatus := 0
+	if hasStatus {
+		upstreamStatus = status
+	}
+	if errors.Is(err, provider.ErrUnauthorized) || (hasStatus && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
+		return "provider_unavailable", errors.New("上游服务暂不可用"), upstreamStatus
+	}
+	if hasStatus && status == http.StatusTooManyRequests {
+		return "rate_limited", err, upstreamStatus
+	}
+	return "generation_failed", err, upstreamStatus
+}
+
+// videoFailureSignature 把失败归类为可比较的签名：有 HTTP 状态时只看状态与阶段，
+// 避免每次请求的文案差异让"同类失败"统计失效。
+func videoFailureSignature(err error) string {
+	if err == nil {
+		return ""
+	}
+	stage := ""
+	if value, ok := provider.VideoErrorStage(err); ok {
+		stage = string(value)
+	}
+	if status, ok := provider.ErrorHTTPStatus(err); ok {
+		return fmt.Sprintf("status=%d|stage=%s", status, stage)
+	}
+	return fmt.Sprintf("stage=%s|%s", stage, sanitizeDiagnosticText(err.Error(), 120))
+}
+
+// videoSafeToRetryCreate 判断失败是否可以在"上游尚未创建视频任务"的前提下换账号重试。
+// create 阶段天然可重试；prepare 阶段（下载首帧、上传素材）只有传输层中断才放宽——
+// 此前一律 fail-closed，一次 EOF 就会白白废掉整个 i2v 任务。
+func videoSafeToRetryCreate(stage provider.VideoStage, hasStage bool, err error) bool {
+	if !hasStage {
+		return false
+	}
+	if stage == provider.VideoStageCreate {
+		return true
+	}
+	return stage == provider.VideoStagePrepare && videoTransportFailure(err)
+}
+
+// videoTransportFailure 判断错误是否只是"连接没走完"：EOF、连接重置、超时。
+// 这类失败没有上游状态码，也没有业务语义，重试不会重复创建任务。
+func videoTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, "connection reset by peer") || strings.Contains(message, "broken pipe")
+}
+
+// videoRetryDelay 按同类失败次数指数退避，首次失败即等待，杜绝无间隔重试风暴。
+func videoRetryDelay(streak int) time.Duration {
+	if streak <= 0 {
+		return 0
+	}
+	delay := videoRetryBackoffBase
+	for i := 1; i < streak && delay < videoRetryBackoffMax; i++ {
+		delay *= 2
+	}
+	if delay > videoRetryBackoffMax {
+		delay = videoRetryBackoffMax
+	}
+	return delay
+}
+
 func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, err error, upstreamStatus int, attempts []audit.Attempt) {
 	now := time.Now().UTC()
 	message := ""
@@ -1375,6 +1631,9 @@ func (s *Service) logVideoGenerationFailure(job media.Job, credential account.Cr
 		"model", job.UpstreamModel,
 		"egress_scope", job.EgressScope,
 		"egress_mode", job.EgressMode,
+		"claim_count", job.ClaimCount,
+		"attempt_count", job.AttemptCount,
+		"defer_count", job.DeferCount,
 		"error", sanitizeDiagnosticText(err.Error(), 512),
 	}
 	if status, ok := provider.ErrorHTTPStatus(err); ok {
@@ -1388,7 +1647,14 @@ func (s *Service) logVideoGenerationFailure(job media.Job, credential account.Cr
 
 func (s *Service) deferVideoJob(ctx context.Context, job media.Job) {
 	now := time.Now().UTC()
-	leaseUntil := now.Add(5 * time.Minute)
+	job.DeferCount++
+	if job.DeferCount > videoMaxDefers {
+		// 延迟重投不是无限许可：超过上限说明系统资源长期不足或客户端已放弃，
+		// 必须终结任务，否则它会一直占着恢复队列。
+		s.failVideoJob(ctx, job, "deferred_too_many_times", errors.New("任务多次延迟重投后仍未执行"), 0, nil)
+		return
+	}
+	leaseUntil := now.Add(videoJobLease)
 	job.Status = media.StatusInProgress
 	job.LeaseUntil = &leaseUntil
 	job.UpdatedAt = now

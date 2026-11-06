@@ -369,6 +369,87 @@ func TestMediaAssetRepositoryListMediaAssetsPaginatesAndCounts(t *testing.T) {
 	}
 }
 
+// TestMediaJobRepositoryReapsZombieJobsAndFencesStaleClaims 覆盖僵尸任务回收契约：
+// 超龄任务与无人轮询的孤儿任务被终结，回收同时清空 claim_token 使旧 worker 写入失效。
+func TestMediaJobRepositoryReapsZombieJobsAndFencesStaleClaims(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "reap-account", SourceKey: "reap-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "reap-key", Prefix: "reap-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	jobRepo := NewMediaJobRepository(database)
+	now := time.Now().UTC()
+
+	stale := testMediaJob("media_job_reap_stale", accountValue.ID, key.ID, mediadomain.StatusQueued, now.Add(-2*time.Hour))
+	orphan := testMediaJob("media_job_reap_orphan", accountValue.ID, key.ID, mediadomain.StatusInProgress, now.Add(-11*time.Minute))
+	polledAt := now.Add(-20 * time.Minute)
+	orphan.LastPolledAt = &polledAt
+	alive := testMediaJob("media_job_reap_alive", accountValue.ID, key.ID, mediadomain.StatusInProgress, now.Add(-2*time.Minute))
+	freshPoll := now.Add(-time.Second)
+	alive.LastPolledAt = &freshPoll
+	for _, job := range []mediadomain.Job{stale, orphan, alive} {
+		if err := jobRepo.CreateMediaJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reaped, err := jobRepo.ReapStaleMediaJobs(ctx, now, 30*time.Minute, 10*time.Minute)
+	if err != nil || reaped != 2 {
+		t.Fatalf("reaped=%d err=%v", reaped, err)
+	}
+	for id, wantCode := range map[string]string{
+		stale.ID:  "expired",
+		orphan.ID: "abandoned",
+	} {
+		value, getErr := jobRepo.GetMediaJob(ctx, id, key.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if value.Status != mediadomain.StatusFailed || value.ErrorCode != wantCode || value.ClaimToken != "" || value.CompletedAt == nil {
+			t.Fatalf("job %s status=%s code=%s token=%q completed=%v", id, value.Status, value.ErrorCode, value.ClaimToken, value.CompletedAt)
+		}
+	}
+	if survived, getErr := jobRepo.GetMediaJob(ctx, alive.ID, key.ID); getErr != nil || survived.Status != mediadomain.StatusInProgress {
+		t.Fatalf("alive job status=%v err=%v", survived.Status, getErr)
+	}
+
+	// 认领计数用于观测，续租必须持有当前 claim_token。
+	claimed, ok, err := jobRepo.TryClaimMediaJob(ctx, alive.ID, now, now.Add(time.Minute), "claim_token_reap_0001")
+	if err != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+	if claimed.ClaimCount != 1 {
+		t.Fatalf("claim count=%d", claimed.ClaimCount)
+	}
+	if renewed, renewErr := jobRepo.RenewMediaJobLease(ctx, alive.ID, "claim_token_reap_0001", now, now.Add(5*time.Minute)); renewErr != nil || !renewed {
+		t.Fatalf("renew renewed=%v err=%v", renewed, renewErr)
+	}
+	if renewed, renewErr := jobRepo.RenewMediaJobLease(ctx, alive.ID, "claim_token_other_0002", now, now.Add(5*time.Minute)); renewErr != nil || renewed {
+		t.Fatalf("foreign token renewed=%v err=%v", renewed, renewErr)
+	}
+
+	// 回收后旧 worker 的写入与续租都必须失败，否则会把已终结任务改回 in_progress。
+	if _, reapErr := jobRepo.ReapStaleMediaJobs(ctx, now.Add(time.Minute), 30*time.Second, time.Hour); reapErr != nil {
+		t.Fatal(reapErr)
+	}
+	if renewed, renewErr := jobRepo.RenewMediaJobLease(ctx, alive.ID, "claim_token_reap_0001", now, now.Add(5*time.Minute)); renewErr != nil || renewed {
+		t.Fatalf("renew after reap renewed=%v err=%v", renewed, renewErr)
+	}
+	claimed.Status, claimed.Progress = mediadomain.StatusCompleted, 100
+	if updateErr := jobRepo.UpdateMediaJob(ctx, claimed); !errors.Is(updateErr, repository.ErrNotFound) {
+		t.Fatalf("fenced update err=%v", updateErr)
+	}
+}
+
 func testMediaJob(id string, accountID, clientKeyID uint64, status mediadomain.Status, createdAt time.Time) mediadomain.Job {
 	job := mediadomain.Job{
 		ID:            id,

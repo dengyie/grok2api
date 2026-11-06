@@ -221,19 +221,17 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 	cohorts := make([]segmentedSelectorCohort, 0, 64)
 	for _, supportsModel := range []bool{false, true} {
 		for _, capabilityKnown := range []bool{false, true} {
-			for _, quotaKnown := range []bool{false, true} {
-				for _, quotaAvailable := range []bool{false, true} {
-					for _, preferFreeBuild := range []bool{false, true} {
-						for _, tier := range []int{0, 2} {
-							for _, priority := range []int{1, 10} {
-								for _, billingFresh := range []bool{false, true} {
-									cohorts = append(cohorts, segmentedSelectorCohort{
-										supportsModel: supportsModel, capabilityKnown: capabilityKnown,
-										quotaKnown: quotaKnown, quotaAvailable: quotaAvailable,
-										preferFreeBuild: preferFreeBuild, tier: tier, priority: priority,
-										billingFresh: billingFresh,
-									})
-								}
+			for _, quotaRank := range []int{quotaRankExhausted, quotaRankUnknown, quotaRankAvailable} {
+				for _, preferFreeBuild := range []bool{false, true} {
+					for _, tier := range []int{0, 2} {
+						for _, priority := range []int{1, 10} {
+							for _, billingFresh := range []bool{false, true} {
+								cohorts = append(cohorts, segmentedSelectorCohort{
+									supportsModel: supportsModel, capabilityKnown: capabilityKnown,
+									quotaRank:       quotaRank,
+									preferFreeBuild: preferFreeBuild, tier: tier, priority: priority,
+									billingFresh: billingFresh,
+								})
 							}
 						}
 					}
@@ -251,8 +249,8 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 				{Credential: account.Credential{ID: 2, Priority: right.priority}, SupportsModel: right.supportsModel, ModelCapabilityKnown: right.capabilityKnown},
 			}
 			scores := []candidateScore{
-				{index: 0, tier: left.tier, quotaKnown: left.quotaKnown, quotaAvailable: left.quotaAvailable, preferFreeBuild: left.preferFreeBuild, billingFresh: left.billingFresh},
-				{index: 1, tier: right.tier, quotaKnown: right.quotaKnown, quotaAvailable: right.quotaAvailable, preferFreeBuild: right.preferFreeBuild, billingFresh: right.billingFresh},
+				{index: 0, tier: left.tier, quotaRank: left.quotaRank, preferFreeBuild: left.preferFreeBuild, billingFresh: left.billingFresh},
+				{index: 1, tier: right.tier, quotaRank: right.quotaRank, preferFreeBuild: right.preferFreeBuild, billingFresh: right.billingFresh},
 			}
 			if got, want := segmentedSelectorCohortBetter(left, right), candidateScoreBetter(values, scores[0], scores[1]); got != want {
 				t.Fatalf("cohort order mismatch at %d/%d: got %t want %t", leftIndex, rightIndex, got, want)

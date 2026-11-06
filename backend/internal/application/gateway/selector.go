@@ -596,7 +596,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			quotaCandidates++
 			continue
 		}
-		if quotaWindowExhausted(candidate, quotaConsumed) {
+		if quotaWindowExhausted(candidate, quotaConsumed, now) {
 			quotaCandidates++
 			if candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
@@ -921,7 +921,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
 			}
-			if quotaWindowExhausted(candidate, quotaConsumed) {
+			if quotaWindowExhausted(candidate, quotaConsumed, now) {
 				var retryAfter time.Duration
 				if candidate.QuotaWindow.ResetAt != nil {
 					retryAfter = retryDelay(now, *candidate.QuotaWindow.ResetAt)
@@ -1200,11 +1200,19 @@ func (s *Selector) quotaConsumptionSnapshot(provider account.Provider) map[accou
 	return result
 }
 
-func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int) bool {
+// quotaWindowExhausted 判断候选账号的额度窗口是否已用尽。上游快照跨过重置时间后
+// 不再代表当前周期，必须视为未知放行：否则上一周期写下的 remaining=0 会把账号
+// 一直挡在路由之外，直到后台额度同步碰巧刷新它（与 candidateQuotaRank 保持一致）。
+// 本地在途消费仍然生效，避免同一周期内被并发超额调度。
+func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int, now time.Time) bool {
 	if candidate.QuotaWindow == nil {
 		return false
 	}
-	remaining := candidate.QuotaWindow.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: candidate.QuotaWindow.Mode}]
+	window := candidate.QuotaWindow
+	if window.Source == account.QuotaSourceUpstream && window.ResetAt != nil && !now.Before(*window.ResetAt) {
+		return false
+	}
+	remaining := window.Remaining - consumed[accountQuotaConsumptionKey{accountID: candidate.Credential.ID, mode: window.Mode}]
 	return remaining <= 0
 }
 

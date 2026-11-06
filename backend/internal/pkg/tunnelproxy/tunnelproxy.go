@@ -27,6 +27,7 @@ import (
 	singmetadata "github.com/metacubex/sing/common/metadata"
 	sscore "github.com/shadowsocks/go-shadowsocks2/core"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
+	xproxy "golang.org/x/net/proxy"
 )
 
 type Config struct {
@@ -718,7 +719,30 @@ type serverDialer struct {
 }
 
 func (d *serverDialer) Conn(ctx context.Context, _ netapi.Address) (net.Conn, error) {
+	if isMeshServerAddr(d.address) {
+		socksDialer, err := xproxy.SOCKS5("tcp", "127.0.0.1:11080", nil, newServerNetDialer())
+		if err == nil {
+			if cd, ok := socksDialer.(xproxy.ContextDialer); ok {
+				if conn, err := cd.DialContext(ctx, "tcp", d.address); err == nil {
+					return conn, nil
+				}
+			}
+		}
+	}
 	return newServerNetDialer().DialContext(ctx, "tcp", d.address)
+}
+
+func isMeshServerAddr(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	ipv4 := ip.To4()
+	return ipv4 != nil && ipv4[0] == 10 && ipv4[1] == 144
 }
 
 func newServerNetDialer() *net.Dialer {

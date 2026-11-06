@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -694,9 +695,114 @@ func (r *videoUsageRepository) TryClaimMediaJob(context.Context, string, time.Ti
 	return media.Job{}, false, nil
 }
 
+func (r *videoUsageRepository) RenewMediaJobLease(context.Context, string, string, time.Time, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (r *videoUsageRepository) TouchMediaJobPolled(context.Context, string, time.Time) error {
+	return nil
+}
+
+func (r *videoUsageRepository) ReapStaleMediaJobs(context.Context, time.Time, time.Duration, time.Duration) (int64, error) {
+	return 0, nil
+}
+
 func (r *videoUsageRepository) MarkMediaJobUsageRecorded(_ context.Context, _ string, recordedAt time.Time) error {
 	r.job.UsageRecordedAt = &recordedAt
 	return nil
+}
+
+// errVideoRateLimitedForTest 模拟携带上游 HTTP 状态与失败阶段的视频错误。
+func errVideoRateLimitedForTest(status int) error {
+	return fmt.Errorf("wrapped: %w", &provider.VideoStageError{Stage: provider.VideoStageCreate, Status: status})
+}
+
+func TestVideoRetryDelayBacksOffExponentially(t *testing.T) {
+	if got := videoRetryDelay(0); got != 0 {
+		t.Fatalf("streak 0 delay = %s", got)
+	}
+	want := []time.Duration{
+		500 * time.Millisecond,
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		videoRetryBackoffMax,
+	}
+	for streak, expected := range want {
+		got := videoRetryDelay(streak + 1)
+		if got != expected {
+			t.Fatalf("streak %d delay = %s, want %s", streak+1, got, expected)
+		}
+		if got > videoRetryBackoffMax {
+			t.Fatalf("streak %d delay %s exceeds cap", streak+1, got)
+		}
+	}
+}
+
+func TestVideoFailureSignatureGroupsIdenticalStatus(t *testing.T) {
+	code429, _, status429 := videoFailureDisposition(errVideoRateLimitedForTest(429))
+	if code429 != "rate_limited" || status429 != http.StatusTooManyRequests {
+		t.Fatalf("429 disposition code=%s status=%d", code429, status429)
+	}
+	if got, want := videoFailureSignature(errVideoRateLimitedForTest(429)), videoFailureSignature(errVideoRateLimitedForTest(429)); got != want {
+		t.Fatalf("same status signatures differ: %s vs %s", got, want)
+	}
+	if got, other := videoFailureSignature(errVideoRateLimitedForTest(429)), videoFailureSignature(errVideoRateLimitedForTest(403)); got == other {
+		t.Fatalf("different statuses share signature %s", got)
+	}
+	code, _, status := videoFailureDisposition(errVideoRateLimitedForTest(403))
+	if code != "provider_unavailable" || status != http.StatusForbidden {
+		t.Fatalf("403 disposition code=%s status=%d", code, status)
+	}
+}
+
+func TestVideoSafeToRetryCreateAllowsPrepareTransportFailures(t *testing.T) {
+	prepareEOF := fmt.Errorf("wrapped: %w", &provider.VideoStageError{
+		Stage: provider.VideoStagePrepare,
+		Err:   fmt.Errorf("Post %q: %w", "https://grok.com/http/upload-file-v2/direct", io.ErrUnexpectedEOF),
+	})
+	if !videoSafeToRetryCreate(provider.VideoStagePrepare, true, prepareEOF) {
+		t.Fatal("prepare-stage EOF must be retriable: no upstream job was created")
+	}
+	if !videoSafeToRetryCreate(provider.VideoStagePrepare, true, &net.OpError{Op: "dial", Err: errors.New("connection refused")}) {
+		t.Fatal("prepare-stage dial failure must be retriable")
+	}
+	validation := fmt.Errorf("wrapped: %w", &provider.VideoStageError{
+		Stage: provider.VideoStagePrepare,
+		Err:   errors.New("duration 必须在 1 到 15 秒之间"),
+	})
+	if videoSafeToRetryCreate(provider.VideoStagePrepare, true, validation) {
+		t.Fatal("prepare-stage validation failure must not be retried")
+	}
+	if !videoSafeToRetryCreate(provider.VideoStageCreate, true, errVideoRateLimitedForTest(429)) {
+		t.Fatal("create-stage failures stay retriable")
+	}
+	if videoSafeToRetryCreate(provider.VideoStagePoll, true, prepareEOF) {
+		t.Fatal("poll-stage failures must never be retried")
+	}
+	if videoSafeToRetryCreate(provider.VideoStagePrepare, false, prepareEOF) {
+		t.Fatal("unattributed failures keep fail-closed semantics")
+	}
+}
+
+func TestVideoTransportFailureClassification(t *testing.T) {
+	for name, err := range map[string]error{
+		"unexpected EOF": io.ErrUnexpectedEOF,
+		"plain EOF":      io.EOF,
+		"deadline":       context.DeadlineExceeded,
+		"reset":          errors.New("read tcp: connection reset by peer"),
+	} {
+		if !videoTransportFailure(err) {
+			t.Fatalf("%s must classify as transport failure", name)
+		}
+	}
+	if videoTransportFailure(errors.New("invalid aspect ratio")) {
+		t.Fatal("business errors must not classify as transport failures")
+	}
+	if videoTransportFailure(nil) {
+		t.Fatal("nil error is not a transport failure")
+	}
 }
 
 func TestResolveVideoAuditStatusCodePrefersUpstream429(t *testing.T) {

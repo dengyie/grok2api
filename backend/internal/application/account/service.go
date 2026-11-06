@@ -2995,10 +2995,18 @@ func (s *Service) ExhaustQuota(ctx context.Context, id uint64, mode string, rese
 			}
 		}
 	}
+	if resetAt == nil {
+		// 必须写入一个可恢复的探测时间：恢复任务只处理 reset_at 非空的窗口
+		// （ListDueQuotaWindows 的 WHERE reset_at IS NOT NULL），而选号侧也会
+		// 把 remaining=0 当作硬过滤。若这里写 NULL，账号会被永久排除在路由外，
+		// 只能靠人工刷新额度才能救回。
+		value := s.now().Add(unknownRemoteQuotaProbeDelay)
+		resetAt = &value
+	}
 	if err := s.accounts.ExhaustQuotaWindow(ctx, id, mode, resetAt, s.now()); err != nil {
 		return err
 	}
-	if resetAt != nil && s.quotaQueue != nil {
+	if s.quotaQueue != nil {
 		return s.quotaQueue.ScheduleQuotaRecovery(ctx, accountdomain.QuotaRecoveryEvent{AccountID: id, Mode: mode, DueAt: *resetAt})
 	}
 	return nil
@@ -3085,11 +3093,13 @@ func preserveActiveQuotaWindows(existing, incoming []accountdomain.QuotaWindow, 
 	return result
 }
 
-// ReconcileRateLimit 根据额度模式核实 429。Web 周池和 Console
-// 均以上游快照为准；Console 的 resource-exhausted 还可能表示瞬时
-// RPS/RPM 限流，不能在未查询 /usage 时直接将账号冻结 24 小时。
+// ReconcileRateLimit 根据额度模式核实 429。Web 周池、Web Imagine 产品额度
+// 和 Console 均以上游快照为准；上游 429 既可能是额度耗尽，也可能只是
+// 瞬时的 RPS/RPM 限流，不能在未查询上游额度时直接将账号冻结一整个窗口。
+// 线上曾因把瞬时 429 直接写成 video_720p remaining=0，白白烧掉账号当天的
+// 视频额度，并把可用号池越缩越小。
 func (s *Service) ReconcileRateLimit(ctx context.Context, id uint64, mode string, retryAfter time.Duration) (RateLimitReconcileState, error) {
-	if mode == "weekly" || isConsoleUsageQuotaMode(mode) {
+	if mode == "weekly" || isWebImagineQuotaMode(mode) || isConsoleUsageQuotaMode(mode) {
 		var window accountdomain.QuotaWindow
 		var err error
 		if isConsoleUsageQuotaMode(mode) {
@@ -3100,6 +3110,7 @@ func (s *Service) ReconcileRateLimit(ctx context.Context, id uint64, mode string
 		if err != nil {
 			if isConsoleUsageQuotaMode(mode) {
 				if errors.Is(err, errQuotaRefreshBusy) {
+					perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "refreshing", Operation: modeBucket(mode)}, 1)
 					return RateLimitReconcileRefreshing, nil
 				}
 				// Keep the last known snapshot on an inconclusive probe and let the
@@ -3108,22 +3119,43 @@ func (s *Service) ReconcileRateLimit(ctx context.Context, id uint64, mode string
 				s.QueueQuotaRefresh(id, mode)
 				s.logger.Warn("console_rate_limit_quota_probe_failed", "account_id", id, "mode", mode, "error", err)
 			}
+			perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "inconclusive", Operation: modeBucket(mode)}, 1)
 			return RateLimitReconcileInconclusive, err
 		}
 		if window.Remaining == 0 || window.UsagePercent >= 100 {
+			perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "exhausted", Operation: modeBucket(mode)}, 1)
 			return RateLimitReconcileExhausted, nil
 		}
+		perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "available", Operation: modeBucket(mode)}, 1)
 		return RateLimitReconcileAvailable, nil
 	}
 	var resetAt *time.Time
 	if retryAfter > 0 {
 		value := s.now().Add(retryAfter)
 		resetAt = &value
+		perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "exhausted_retry_after", Operation: modeBucket(mode)}, 1)
+	} else {
+		perfmetrics.Default.Add("rate_limit_reconcile", perfmetrics.Labels{Subsystem: "quota", Stage: "rate_limit", Outcome: "exhausted_unknown", Operation: modeBucket(mode)}, 1)
 	}
 	if err := s.ExhaustQuota(ctx, id, mode, resetAt); err != nil {
 		return RateLimitReconcileInconclusive, err
 	}
 	return RateLimitReconcileExhausted, nil
+}
+
+// modeBucket 收敛 429 核对指标的基数：同一产品下的子模式合并为一个标签，
+// 避免额度模式膨胀成高基数维度。
+func modeBucket(mode string) string {
+	switch {
+	case mode == "weekly":
+		return "weekly"
+	case isWebImagineQuotaMode(mode):
+		return "web_imagine"
+	case isConsoleUsageQuotaMode(mode):
+		return "console"
+	default:
+		return mode
+	}
 }
 
 func (s *Service) ReconcileWebRateLimit(ctx context.Context, id uint64, mode string, retryAfter time.Duration) (bool, error) {

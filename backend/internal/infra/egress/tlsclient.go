@@ -84,6 +84,12 @@ func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 				return nil, fmt.Errorf("创建浏览器隧道代理: %w", err)
 			}
 			options = append(options, tlsclient.WithDialContext(dialer.DialContext))
+		} else if IsMeshAddr(parsed.Host) {
+			dialer, err := NewProxyDialerWithMeshSupport(parsed, nil)
+			if err != nil {
+				return nil, fmt.Errorf("创建浏览器 mesh 代理: %w", err)
+			}
+			options = append(options, tlsclient.WithDialContext(dialContext(dialer)))
 		} else {
 			options = append(options, tlsclient.WithProxyUrl(proxyURL))
 		}

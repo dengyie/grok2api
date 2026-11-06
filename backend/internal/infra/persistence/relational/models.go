@@ -444,7 +444,11 @@ type mediaJobModel struct {
 	ErrorCode       string `gorm:"size:100;not null;default:'';check:chk_media_jobs_error_code,length(error_code) <= 100"`
 	ErrorMessage    string `gorm:"size:512;not null;default:'';check:chk_media_jobs_error_message,length(error_message) <= 512"`
 	LeaseUntil      *time.Time
-	ClaimToken      string    `gorm:"size:64;not null;default:'';check:chk_media_jobs_claim_token,claim_token = '' OR length(claim_token) BETWEEN 16 AND 64"`
+	ClaimToken      string `gorm:"size:64;not null;default:'';check:chk_media_jobs_claim_token,claim_token = '' OR length(claim_token) BETWEEN 16 AND 64"`
+	LastPolledAt    *time.Time
+	ClaimCount      int       `gorm:"not null;default:0;check:chk_media_jobs_claim_count,claim_count >= 0"`
+	AttemptCount    int       `gorm:"not null;default:0;check:chk_media_jobs_attempt_count,attempt_count >= 0"`
+	DeferCount      int       `gorm:"not null;default:0;check:chk_media_jobs_defer_count,defer_count >= 0"`
 	CreatedAt       time.Time `gorm:"not null"`
 	UpdatedAt       time.Time `gorm:"not null"`
 	CompletedAt     *time.Time

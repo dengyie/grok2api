@@ -16,12 +16,38 @@ type candidateScore struct {
 	webCatalogSupport bool
 	tier              int
 	preferFreeBuild   bool
-	quotaKnown        bool
-	quotaAvailable    bool
+	quotaRank         int
 	billingFresh      bool
 	inFlight          int
 	remaining         float64
 	lastSelected      time.Time
+}
+
+const (
+	// quotaRankExhausted 表示上游快照明确为 0 且窗口尚未重置。
+	quotaRankExhausted = iota
+	// quotaRankUnknown 表示没有可信快照，或窗口已跨过重置时间但还没重新同步。
+	quotaRankUnknown
+	// quotaRankAvailable 表示上游快照显示窗口内仍有额度。
+	quotaRankAvailable
+)
+
+// candidateQuotaRank 把额度快照折算成排序档位。已知耗尽必须排在未知之后：
+// 否则 429 之后被本地标记为耗尽的账号会长期压过从未同步过额度的账号，
+// 每轮都先撞一次 429 才轮到可能还有额度的号。
+func candidateQuotaRank(candidate account.RoutingCandidate, now time.Time) int {
+	window := candidate.QuotaWindow
+	if window == nil || window.Source != account.QuotaSourceUpstream {
+		return quotaRankUnknown
+	}
+	if window.ResetAt != nil && !now.Before(*window.ResetAt) {
+		// 窗口已经跨过重置时间，本地快照不再代表当前周期。
+		return quotaRankUnknown
+	}
+	if window.Remaining > 0 {
+		return quotaRankAvailable
+	}
+	return quotaRankExhausted
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -79,11 +105,10 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	// A synced remote window with remaining quota is a stronger routing signal
 	// than priority or tier. Unknown windows remain eligible as a fallback, but
 	// cannot displace an account whose requested mode is known to be available.
-	if leftScore.quotaAvailable != rightScore.quotaAvailable {
-		return leftScore.quotaAvailable
-	}
-	if leftScore.quotaKnown != rightScore.quotaKnown {
-		return leftScore.quotaKnown
+	// A window known to be exhausted ranks below unknown: it is the one signal
+	// that provably leads to an upstream 429.
+	if leftScore.quotaRank != rightScore.quotaRank {
+		return leftScore.quotaRank > rightScore.quotaRank
 	}
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
@@ -199,10 +224,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		}
 		// 只有真实上游快照能够证明账号具备该模式额度。历史默认值和
 		// 本地预测值都属于未知能力，只保留为路由兜底。
-		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Source == account.QuotaSourceUpstream {
-			score.quotaKnown = true
-			score.quotaAvailable = candidate.QuotaWindow.Remaining > 0
-		}
+		score.quotaRank = candidateQuotaRank(candidate, now)
 		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute

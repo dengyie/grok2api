@@ -57,12 +57,20 @@ type Job struct {
 	InputImageCount int
 	UpstreamURL     string
 	// ResultAssetID 指向本地媒体资产；XAI ZDR 上传完成后优先从此读取。
-	ResultAssetID   string
-	ContentType     string
-	ErrorCode       string
-	ErrorMessage    string
-	LeaseUntil      *time.Time
-	ClaimToken      string
+	ResultAssetID string
+	ContentType   string
+	ErrorCode     string
+	ErrorMessage  string
+	LeaseUntil    *time.Time
+	ClaimToken    string
+	// LastPolledAt 记录客户端最后一次查询该任务的时间，用于判定孤儿任务。
+	LastPolledAt *time.Time
+	// ClaimCount 记录被 worker 认领的次数，AttemptCount 记录上游尝试次数。
+	// 两者只用于观测与回收判据，不参与路由。
+	ClaimCount   int
+	AttemptCount int
+	// DeferCount 记录任务被延迟重投的次数，超过上限即终止，避免延迟循环。
+	DeferCount      int
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 	CompletedAt     *time.Time

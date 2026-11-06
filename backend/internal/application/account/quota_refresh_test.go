@@ -1324,6 +1324,169 @@ func (a *imagineQuotaGroupAdapter) SyncQuotaGroup(_ context.Context, credential 
 	}, nil
 }
 
+func TestReconcileWebImagineRateLimitVerifiesQuotaBeforeExhausting(t *testing.T) {
+	// 线上 19:47：视频 429 曾把访问过的账号全部写成 video_720p remaining=0，
+	// 实际重新探测其中两个账号额度仍然可用。这里锁定 Web Imagine 产品额度
+	// 也必须先探测上游，再决定是否标记耗尽。
+	tests := []struct {
+		name      string
+		mode      string
+		remaining int
+		wantState RateLimitReconcileState
+	}{
+		{name: "transient 429 keeps video quota", mode: accountdomain.QuotaModeWebVideo720p, remaining: 1, wantState: RateLimitReconcileAvailable},
+		{name: "confirmed zero video quota", mode: accountdomain.QuotaModeWebVideo720p, remaining: 0, wantState: RateLimitReconcileExhausted},
+		{name: "transient 429 keeps image quota", mode: accountdomain.QuotaModeWebImagePro, remaining: 2, wantState: RateLimitReconcileAvailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-rate-limit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			if err := database.InitializeSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			accounts := relational.NewAccountRepository(database)
+			credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+				Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+				Name: "web-rate-limit", SourceKey: "web-rate-limit", EncryptedAccessToken: "encrypted",
+				Enabled: true, AuthStatus: accountdomain.AuthStatusActive, WebTier: accountdomain.WebTierBasic,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter := &rateLimitWebQuotaAdapter{mode: test.mode, remaining: test.remaining}
+			service := NewService(accounts, nil, nil, nil, provider.NewRegistry(adapter), nil, nil)
+			service.SetQuotaRecoveryQueue(memory.NewQuotaRecoveryQueue())
+
+			state, err := service.ReconcileRateLimit(ctx, credential.ID, test.mode, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != test.wantState || adapter.groupCalls.Load() != 1 {
+				t.Fatalf("state=%s modeCalls=%d, want state=%s with one probe", state, adapter.groupCalls.Load(), test.wantState)
+			}
+			stored, err := accounts.GetQuotaWindows(ctx, []uint64{credential.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			window, ok := quotaWindowByMode(stored[credential.ID], test.mode)
+			if !ok {
+				t.Fatalf("quota window %s missing after reconcile", test.mode)
+			}
+			if window.Remaining != test.remaining || window.Source != accountdomain.QuotaSourceUpstream {
+				t.Fatalf("stored %s window = remaining %d source %s, want upstream probe remaining %d",
+					test.mode, window.Remaining, window.Source, test.remaining)
+			}
+		})
+	}
+}
+
+func TestReconcileWebImagineRateLimitKeepsSnapshotWhenProbeFails(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-rate-limit-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "web-rate-limit-retry", SourceKey: "web-rate-limit-retry", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, WebTier: accountdomain.WebTierBasic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	resetAt := now.Add(6 * time.Hour)
+	if err := accounts.ReplaceQuotaWindows(ctx, credential.ID, accountdomain.WebTierBasic, now, []accountdomain.QuotaWindow{{
+		Mode: accountdomain.QuotaModeWebVideo720p, Remaining: 1, Total: 1,
+		SyncedAt: &now, ResetAt: &resetAt, Source: accountdomain.QuotaSourceUpstream,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &rateLimitWebQuotaAdapter{mode: accountdomain.QuotaModeWebVideo720p, err: errors.New("quota probe timeout")}
+	service := NewService(accounts, nil, nil, nil, provider.NewRegistry(adapter), nil, nil)
+	if state, err := service.ReconcileRateLimit(ctx, credential.ID, accountdomain.QuotaModeWebVideo720p, 0); err == nil || state != RateLimitReconcileInconclusive {
+		t.Fatalf("state=%s err=%v, want inconclusive on failed probe", state, err)
+	}
+	stored, err := accounts.GetQuotaWindows(ctx, []uint64{credential.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, ok := quotaWindowByMode(stored[credential.ID], accountdomain.QuotaModeWebVideo720p)
+	if !ok || window.Remaining != 1 {
+		t.Fatalf("failed probe overwrote last snapshot: %#v", window)
+	}
+}
+
+type rateLimitWebQuotaAdapter struct {
+	mode       string
+	remaining  int
+	err        error
+	groupCalls atomic.Int64
+}
+
+func (a *rateLimitWebQuotaAdapter) Provider() accountdomain.Provider {
+	return accountdomain.ProviderWeb
+}
+
+func (a *rateLimitWebQuotaAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: accountdomain.ProviderWeb, ModelNamespace: accountdomain.ProviderWeb.ModelNamespace(),
+		Quota: provider.QuotaRemoteWindow, Credential: provider.CredentialSurface{AuthType: accountdomain.AuthTypeSSO},
+	}
+}
+
+func (a *rateLimitWebQuotaAdapter) SyncQuota(context.Context, accountdomain.Credential) (provider.QuotaSnapshot, error) {
+	return provider.QuotaSnapshot{}, errors.New("unexpected full quota sync")
+}
+
+func (a *rateLimitWebQuotaAdapter) SyncQuotaMode(context.Context, accountdomain.Credential, string) (accountdomain.QuotaWindow, error) {
+	return accountdomain.QuotaWindow{}, errors.New("unexpected single-mode web quota sync")
+}
+
+func (a *rateLimitWebQuotaAdapter) SyncQuotaGroup(_ context.Context, credential accountdomain.Credential, group string) (provider.QuotaGroupSnapshot, error) {
+	a.groupCalls.Add(1)
+	if group != accountdomain.QuotaGroupWebImagine {
+		return provider.QuotaGroupSnapshot{}, fmt.Errorf("unexpected quota group %q", group)
+	}
+	if a.err != nil {
+		return provider.QuotaGroupSnapshot{}, a.err
+	}
+	now := time.Now().UTC()
+	resetAt := now.Add(23 * time.Hour)
+	window := func(mode string, remaining int) accountdomain.QuotaWindow {
+		return accountdomain.QuotaWindow{
+			AccountID: credential.ID, Mode: mode, Remaining: remaining, Total: 1,
+			SyncedAt: &now, ResetAt: &resetAt, Source: accountdomain.QuotaSourceUpstream, UpdatedAt: now,
+		}
+	}
+	imagePro, video720p := 3, 1
+	switch a.mode {
+	case accountdomain.QuotaModeWebImagePro:
+		imagePro = a.remaining
+	case accountdomain.QuotaModeWebVideo720p:
+		video720p = a.remaining
+	}
+	return provider.QuotaGroupSnapshot{
+		Group: group, Modes: accountdomain.WebImagineQuotaModes(), SyncedAt: now,
+		Windows: []accountdomain.QuotaWindow{
+			window(accountdomain.QuotaModeWebImagePro, imagePro),
+			window(accountdomain.QuotaModeWebImageEdit, 1),
+			window(accountdomain.QuotaModeWebVideo, 1),
+			window(accountdomain.QuotaModeWebVideo720p, video720p),
+		},
+	}, nil
+}
+
 type consoleQuotaSnapshotAdapter struct {
 	fullCalls   atomic.Int64
 	modeCalls   atomic.Int64
@@ -1430,4 +1593,55 @@ func (a *quotaCountingAdapter) SyncQuotaMode(_ context.Context, credential accou
 		AccountID: credential.ID, Mode: mode, Remaining: 0, Total: 30,
 		WindowSeconds: 3600, ResetAt: &resetAt, SyncedAt: &now, Source: accountdomain.QuotaSourceUpstream, UpdatedAt: now,
 	}, nil
+}
+
+func TestExhaustQuotaSchedulesRecoveryWithoutResetTime(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "exhaust-unknown-reset.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "exhaust-unknown-reset", SourceKey: "exhaust-unknown-reset", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := accounts.ReplaceQuotaWindows(ctx, credential.ID, "", now, []accountdomain.QuotaWindow{
+		{Mode: accountdomain.QuotaModeWebVideo720p, Remaining: 1, Total: 1, SyncedAt: &now, Source: accountdomain.QuotaSourceEstimated},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(accounts, nil, nil, nil, nil, nil, nil)
+	queue := memory.NewQuotaRecoveryQueue()
+	service.SetQuotaRecoveryQueue(queue)
+	if err := service.ExhaustQuota(ctx, credential.ID, accountdomain.QuotaModeWebVideo720p, nil); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := accounts.GetQuotaWindows(ctx, []uint64{credential.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, ok := quotaWindowByMode(stored[credential.ID], accountdomain.QuotaModeWebVideo720p)
+	if !ok || window.Remaining != 0 {
+		t.Fatalf("stored window = %#v, want remaining=0", window)
+	}
+	if window.ResetAt == nil {
+		t.Fatal("exhausted window has NULL reset_at and can never be recovered")
+	}
+	events, err := queue.ClaimDueQuotaRecoveries(ctx, now.Add(10*time.Minute), 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].AccountID != credential.ID || events[0].Mode != accountdomain.QuotaModeWebVideo720p {
+		t.Fatalf("recovery events = %#v, want one event for the exhausted window", events)
+	}
 }

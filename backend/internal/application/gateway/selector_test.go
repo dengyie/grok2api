@@ -1232,9 +1232,66 @@ func TestCandidatePlanPrefersKnownRemainingQuota(t *testing.T) {
 		{Credential: account.Credential{ID: 1, Priority: 100}},
 		{Credential: account.Credential{ID: 2, Priority: 1}, QuotaWindow: &account.QuotaWindow{AccountID: 2, Mode: "console_image", Remaining: 2, Total: 5}},
 	}
-	scores := []candidateScore{{index: 0}, {index: 1, quotaKnown: true, quotaAvailable: true}}
+	scores := []candidateScore{{index: 0}, {index: 1, quotaRank: quotaRankAvailable}}
 	if !candidateScoreBetter(values, scores[1], scores[0]) {
 		t.Fatal("known remaining quota did not outrank an unknown window")
+	}
+}
+
+func TestCandidateQuotaRankClassifiesSnapshots(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(time.Hour)
+	past := now.Add(-time.Minute)
+	video := func(remaining int, source account.QuotaSource, resetAt *time.Time) *account.QuotaWindow {
+		return &account.QuotaWindow{AccountID: 1, Mode: account.QuotaModeWebVideo720p, Remaining: remaining, Source: source, ResetAt: resetAt}
+	}
+	cases := []struct {
+		name   string
+		window *account.QuotaWindow
+		want   int
+	}{
+		{name: "no window", window: nil, want: quotaRankUnknown},
+		{name: "estimated source", window: video(0, account.QuotaSourceEstimated, &future), want: quotaRankUnknown},
+		{name: "upstream remaining", window: video(1, account.QuotaSourceUpstream, &future), want: quotaRankAvailable},
+		{name: "upstream exhausted", window: video(0, account.QuotaSourceUpstream, &future), want: quotaRankExhausted},
+		// 窗口已过重置时间，本地 remaining 不再代表当前周期。
+		{name: "window rolled over", window: video(0, account.QuotaSourceUpstream, &past), want: quotaRankUnknown},
+	}
+	for _, testCase := range cases {
+		candidate := account.RoutingCandidate{Credential: account.Credential{ID: 1}, QuotaWindow: testCase.window}
+		if got := candidateQuotaRank(candidate, now); got != testCase.want {
+			t.Fatalf("%s: rank = %d, want %d", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// TestCandidatePlanRanksExhaustedQuotaBelowUnknown 覆盖线上 429 的选号路径：
+// 已耗尽窗口的账号不能因为"额度已知"就压过尚未同步额度的账号。
+func TestCandidatePlanRanksExhaustedQuotaBelowUnknown(t *testing.T) {
+	now := time.Now().UTC()
+	reset := now.Add(6 * time.Hour)
+	values := []account.RoutingCandidate{
+		{
+			Credential:  account.Credential{ID: 1, Provider: account.ProviderWeb, Priority: 100},
+			QuotaWindow: &account.QuotaWindow{AccountID: 1, Mode: account.QuotaModeWebVideo720p, Remaining: 0, Source: account.QuotaSourceUpstream, ResetAt: &reset},
+		},
+		{Credential: account.Credential{ID: 2, Provider: account.ProviderWeb, Priority: 1}},
+		{
+			Credential:  account.Credential{ID: 3, Provider: account.ProviderWeb, Priority: 1},
+			QuotaWindow: &account.QuotaWindow{AccountID: 3, Mode: account.QuotaModeWebVideo720p, Remaining: 1, Source: account.QuotaSourceUpstream, ResetAt: &reset},
+		},
+	}
+	selector := NewSelector(nil, memory.NewConcurrencyLimiter(), nil, nil, time.Hour, time.Second, time.Minute)
+	plan, err := selector.planCandidates(context.Background(), values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordered := make([]uint64, 0, len(values))
+	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
+		ordered = append(ordered, candidate.Credential.ID)
+	}
+	if expected := []uint64{3, 2, 1}; !slices.Equal(ordered, expected) {
+		t.Fatalf("候选顺序 = %v, want %v", ordered, expected)
 	}
 }
 
@@ -1284,16 +1341,58 @@ func TestSelectorConsumesOnlyMatchingQuotaSnapshot(t *testing.T) {
 		t.Fatalf("published snapshot was mutated: %#v", original[0].QuotaWindow)
 	}
 	consumed := selector.quotaConsumptionSnapshot(account.ProviderWeb)
-	if quotaWindowExhausted(values[0], consumed) {
+	now := time.Now().UTC()
+	if quotaWindowExhausted(values[0], consumed, now) {
 		t.Fatal("partially consumed quota was treated as exhausted")
 	}
 	selector.ConsumeQuota(account.ProviderWeb, 7, "other", 100)
-	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+	if quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb), now) {
 		t.Fatal("a different quota mode affected the candidate")
 	}
 	selector.ConsumeQuota(account.ProviderWeb, 7, "fast", 7)
-	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb)) {
+	if !quotaWindowExhausted(values[0], selector.quotaConsumptionSnapshot(account.ProviderWeb), now) {
 		t.Fatal("fully consumed quota remained schedulable")
+	}
+}
+
+func TestQuotaWindowExhaustedReleasesWindowPastReset(t *testing.T) {
+	now := time.Now().UTC()
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Hour)
+	cases := []struct {
+		name    string
+		window  *account.QuotaWindow
+		expired bool
+	}{
+		{"nil window", nil, false},
+		{
+			name:    "upstream exhausted before reset",
+			window:  &account.QuotaWindow{AccountID: 1, Mode: "video_720p", Remaining: 0, Source: account.QuotaSourceUpstream, ResetAt: &future},
+			expired: true,
+		},
+		{
+			name:    "upstream exhausted with reset passed",
+			window:  &account.QuotaWindow{AccountID: 1, Mode: "video_720p", Remaining: 0, Source: account.QuotaSourceUpstream, ResetAt: &past},
+			expired: false,
+		},
+		{
+			name:    "upstream remaining ignores passed reset",
+			window:  &account.QuotaWindow{AccountID: 1, Mode: "video_720p", Remaining: 1, Source: account.QuotaSourceUpstream, ResetAt: &past},
+			expired: false,
+		},
+		{
+			name:    "estimated snapshot exhausted stays filtered",
+			window:  &account.QuotaWindow{AccountID: 1, Mode: "video_720p", Remaining: 0, Source: account.QuotaSourceEstimated},
+			expired: true,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := account.RoutingCandidate{Credential: account.Credential{ID: 1}, QuotaWindow: testCase.window}
+			if got := quotaWindowExhausted(candidate, nil, now); got != testCase.expired {
+				t.Fatalf("quotaWindowExhausted = %v, want %v", got, testCase.expired)
+			}
+		})
 	}
 }
 
@@ -1821,7 +1920,7 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 func TestBoundUpstreamRetryAfter(t *testing.T) {
 	selector := &Selector{cooldownMax: time.Minute}
 	tests := []struct {
-		name string
+		name  string
 		input time.Duration
 		want  time.Duration
 	}{

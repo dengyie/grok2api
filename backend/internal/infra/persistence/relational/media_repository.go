@@ -332,7 +332,10 @@ func (r *MediaJobRepository) UpdateMediaJob(ctx context.Context, value media.Job
 	}
 	// InputJSON and InputImageCount are immutable creation metadata. Progress and
 	// terminal updates must not resend a multi-megabyte Base64 payload.
-	result := query.Select("request_id", "client_key_name", "account_id", "account_name", "egress_node_id", "egress_node_name", "egress_scope", "egress_mode", "provider", "model", "model_route_id", "upstream_model", "prompt", "seconds", "size", "quality", "status", "progress", "upstream_url", "result_asset_id", "content_type", "error_code", "error_message", "lease_until", "claim_token", "updated_at", "completed_at", "usage_recorded_at").Updates(updates)
+	// claim_count / last_polled_at are owned by TryClaimMediaJob and
+	// TouchMediaJobPolled, so they are deliberately excluded here to avoid the
+	// full-row update clobbering a concurrent counter bump.
+	result := query.Select("request_id", "client_key_name", "account_id", "account_name", "egress_node_id", "egress_node_name", "egress_scope", "egress_mode", "provider", "model", "model_route_id", "upstream_model", "prompt", "seconds", "size", "quality", "status", "progress", "upstream_url", "result_asset_id", "content_type", "error_code", "error_message", "lease_until", "claim_token", "attempt_count", "defer_count", "updated_at", "completed_at", "usage_recorded_at").Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -468,7 +471,10 @@ func (r *MediaJobRepository) TryClaimMediaJob(ctx context.Context, id string, no
 	}
 	result := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
 		Where("id = ? AND (status = ? OR (status = ? AND (lease_until IS NULL OR lease_until <= ?)))", id, media.StatusQueued, media.StatusInProgress, now).
-		Updates(map[string]any{"status": media.StatusInProgress, "lease_until": leaseUntil, "claim_token": claimToken, "updated_at": now})
+		Updates(map[string]any{
+			"status": media.StatusInProgress, "lease_until": leaseUntil, "claim_token": claimToken,
+			"claim_count": gorm.Expr("claim_count + 1"), "updated_at": now,
+		})
 	if result.Error != nil {
 		return media.Job{}, false, result.Error
 	}
@@ -480,6 +486,64 @@ func (r *MediaJobRepository) TryClaimMediaJob(ctx context.Context, id string, no
 		return media.Job{}, false, mapError(err)
 	}
 	return mediaJobToDomain(row), true, nil
+}
+
+// RenewMediaJobLease 以 claim_token 围栏续租，失去所有权时返回 false，
+// 使已被回收或已被其他 worker 接管的任务不再被本 goroutine 续命。
+func (r *MediaJobRepository) RenewMediaJobLease(ctx context.Context, id, claimToken string, now, leaseUntil time.Time) (bool, error) {
+	if claimToken == "" {
+		return false, nil
+	}
+	result := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+		Where("id = ? AND claim_token = ? AND status = ?", id, claimToken, media.StatusInProgress).
+		Updates(map[string]any{"lease_until": leaseUntil, "updated_at": now})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// TouchMediaJobPolled 记录客户端最后一次查询时间。任务不存在时静默成功，
+// 避免轮询热点路径因历史数据缺失而报错。
+func (r *MediaJobRepository) TouchMediaJobPolled(ctx context.Context, id string, at time.Time) error {
+	return r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+		Where("id = ?", id).
+		UpdateColumn("last_polled_at", at).Error
+}
+
+// ReapStaleMediaJobs 终结两类僵尸任务：超过最大存活时间的任务，以及客户端
+// 长期不再轮询的孤儿任务。回收时清空 claim_token，令在跑 worker 的后续写入
+// 因为围栏失败而失效，从而不会把任务改回 in_progress。
+func (r *MediaJobRepository) ReapStaleMediaJobs(ctx context.Context, now time.Time, maxAge, abandonAfter time.Duration) (int64, error) {
+	active := []media.Status{media.StatusQueued, media.StatusInProgress}
+	var total int64
+	if maxAge > 0 {
+		result := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+			Where("status IN ? AND created_at <= ?", active, now.Add(-maxAge)).
+			Updates(map[string]any{
+				"status": media.StatusFailed, "error_code": "expired",
+				"error_message": "视频任务超过最大存活时间被回收", "progress": 0,
+				"lease_until": nil, "claim_token": "", "completed_at": now, "updated_at": now,
+			})
+		if result.Error != nil {
+			return total, result.Error
+		}
+		total += result.RowsAffected
+	}
+	if abandonAfter > 0 {
+		result := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+			Where("status IN ? AND COALESCE(last_polled_at, created_at) <= ?", active, now.Add(-abandonAfter)).
+			Updates(map[string]any{
+				"status": media.StatusFailed, "error_code": "abandoned",
+				"error_message": "客户端长时间未轮询，任务已被回收", "progress": 0,
+				"lease_until": nil, "claim_token": "", "completed_at": now, "updated_at": now,
+			})
+		if result.Error != nil {
+			return total, result.Error
+		}
+		total += result.RowsAffected
+	}
+	return total, nil
 }
 
 func mediaJobFromDomain(value media.Job) *mediaJobModel {
@@ -496,7 +560,9 @@ func mediaJobFromDomain(value media.Job) *mediaJobModel {
 		Prompt: value.Prompt, Seconds: value.Seconds, Size: value.Size, Quality: value.Quality,
 		Status: string(value.Status), Progress: value.Progress, InputJSON: value.InputJSON, InputImageCount: mediaJobInputImageCount(value.InputImageCount), UpstreamURL: value.UpstreamURL,
 		ResultAssetID: value.ResultAssetID, ContentType: value.ContentType, ErrorCode: value.ErrorCode, ErrorMessage: value.ErrorMessage,
-		LeaseUntil: value.LeaseUntil, ClaimToken: value.ClaimToken, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		LeaseUntil: value.LeaseUntil, ClaimToken: value.ClaimToken,
+		LastPolledAt: value.LastPolledAt, ClaimCount: value.ClaimCount, AttemptCount: value.AttemptCount,
+		DeferCount: value.DeferCount, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		CompletedAt: value.CompletedAt, UsageRecordedAt: value.UsageRecordedAt,
 	}
 }
@@ -523,7 +589,9 @@ func mediaJobToDomain(row mediaJobModel) media.Job {
 		Prompt: row.Prompt, Seconds: row.Seconds, Size: row.Size, Quality: row.Quality,
 		Status: media.Status(row.Status), Progress: row.Progress, InputJSON: row.InputJSON, InputImageCount: inputImageCount, UpstreamURL: row.UpstreamURL,
 		ResultAssetID: row.ResultAssetID, ContentType: row.ContentType, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage,
-		LeaseUntil: row.LeaseUntil, ClaimToken: row.ClaimToken, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		LeaseUntil: row.LeaseUntil, ClaimToken: row.ClaimToken,
+		LastPolledAt: row.LastPolledAt, ClaimCount: row.ClaimCount, AttemptCount: row.AttemptCount,
+		DeferCount: row.DeferCount, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		CompletedAt: row.CompletedAt, UsageRecordedAt: row.UsageRecordedAt,
 	}
 }

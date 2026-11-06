@@ -62,6 +62,13 @@ type MediaJobRepository interface {
 	ListRecoverableMediaJobs(ctx context.Context, limit int) ([]media.Job, error)
 	ListUnrecordedTerminalMediaJobs(ctx context.Context, limit int) ([]media.Job, error)
 	TryClaimMediaJob(ctx context.Context, id string, now, leaseUntil time.Time, claimToken string) (media.Job, bool, error)
+	// RenewMediaJobLease 以 claim_token 围栏续租；失去所有权时返回 false。
+	RenewMediaJobLease(ctx context.Context, id, claimToken string, now, leaseUntil time.Time) (bool, error)
+	// TouchMediaJobPolled 记录客户端最后一次查询时间，用于孤儿任务判定。
+	TouchMediaJobPolled(ctx context.Context, id string, at time.Time) error
+	// ReapStaleMediaJobs 终结超龄任务与无人轮询的孤儿任务，并清空 claim_token
+	// 使在跑 worker 的后续写入失效。返回受影响行数。
+	ReapStaleMediaJobs(ctx context.Context, now time.Time, maxAge, abandonAfter time.Duration) (int64, error)
 	MarkMediaJobUsageRecorded(ctx context.Context, id string, recordedAt time.Time) error
 }
 

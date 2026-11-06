@@ -1280,6 +1280,9 @@ func (a *Adapter) uploadFileV2Direct(ctx context.Context, cfg Config, lease *egr
 	applyAppHeaders(request.Header, cfg.BaseURL, referer)
 	response, err := lease.DoDeferredForbidden(request)
 	if err != nil {
+		// 上传是大 body POST，对隧道 MTU/质量最敏感：EOF/重置说明出口链路本身不可用。
+		// 不回传健康度的话，坏节点会一直保持 healthy，继续承接粘性绑定在它上面的账号。
+		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
 		return uploadedFile{}, err
 	}
 	defer response.Body.Close()

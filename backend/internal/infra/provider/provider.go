@@ -74,8 +74,9 @@ type VideoStage string
 
 const (
 	// VideoStagePrepare is local work performed before the create request is sent.
-	// It is not account-failover eligible because retrying deterministic local
-	// validation or configuration failures against another credential is useless.
+	// Deterministic failures (validation, configuration) must not be retried against
+	// another credential; transport failures (EOF, reset, timeout) are safe to retry
+	// because no upstream job exists yet — the gateway decides that split.
 	VideoStagePrepare VideoStage = "prepare"
 	// VideoStageCreate means the upstream explicitly rejected the create request.
 	// Account failover is safe only for the retryable 4xx statuses selected by
