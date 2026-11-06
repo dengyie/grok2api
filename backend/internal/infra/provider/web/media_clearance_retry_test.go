@@ -37,6 +37,13 @@ func TestIsClearanceRefreshableMediaError(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := newWebMediaUpstreamError(test.code, []byte(test.body), false)
+			retryable, ok := any(err).(interface{ VideoPreparationRetryable() bool })
+			if test.want && (!ok || !retryable.VideoPreparationRetryable()) {
+				t.Fatal("recognized upload challenge cannot resume through the video gateway")
+			}
+			if !test.want && ok && retryable.VideoPreparationRetryable() {
+				t.Fatal("policy/server errors must not be retried as upload challenges")
+			}
 			if got := isClearanceRefreshableMediaError(err); got != test.want {
 				t.Fatalf("refreshable=%v, want %v (kind=%q challenge=%v)", got, test.want, err.bodyKind, err.cloudflareChallenge)
 			}

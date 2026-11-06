@@ -56,6 +56,13 @@ func isClearanceRefreshableMediaError(e *webMediaUpstreamError) bool {
 	return e.cloudflareChallenge || e.bodyKind == "empty" || e.bodyKind == "html"
 }
 
+// VideoPreparationRetryable exposes the existing challenge classification to
+// the gateway. It is consulted only before a video create request; structured
+// policy rejections and other statuses do not authorize a replay.
+func (e *webMediaUpstreamError) VideoPreparationRetryable() bool {
+	return isClearanceRefreshableMediaError(e)
+}
+
 // isStatsigRefreshableMediaError identifies application-layer rejections that
 // tell the browser to reload its page state. Grok uses code 7 for this anti-bot
 // response, but the same code can also wrap a definitive account block; blocked
