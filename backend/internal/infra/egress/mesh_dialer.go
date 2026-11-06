@@ -5,17 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/chenyme/grok2api/backend/internal/pkg/easytier"
 	xproxy "golang.org/x/net/proxy"
 )
-
-// defaultEasyTierSocks5Proxy is the local user-space SOCKS5 endpoint exposed by
-// EasyTier when running in no-tun mode (e.g., inside container environments like Bohrium).
-const defaultEasyTierSocks5Proxy = "127.0.0.1:11080"
 
 var (
 	meshDialerMu sync.RWMutex
@@ -28,30 +24,16 @@ type ContextAndDirectDialer interface {
 	xproxy.ContextDialer
 }
 
-// IsMeshAddr checks if the given host or host:port belongs to the EasyTier mesh
-// private IPv4 range (10.144.0.0/16).
+// IsMeshAddr reports whether the host or host:port belongs to the EasyTier
+// mesh private IPv4 range. Consensus lives in internal/pkg/easytier.
 func IsMeshAddr(hostOrAddr string) bool {
-	host := strings.TrimSpace(hostOrAddr)
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	ipv4 := ip.To4()
-	if ipv4 == nil {
-		return false
-	}
-	return ipv4[0] == 10 && ipv4[1] == 144
+	return easytier.IsMeshAddr(hostOrAddr)
 }
 
-// EasyTierProxyEndpoint returns the configured or default EasyTier SOCKS5 proxy endpoint.
+// EasyTierProxyEndpoint returns the configured or default EasyTier SOCKS5 proxy
+// endpoint.
 func EasyTierProxyEndpoint() string {
-	if ep := strings.TrimSpace(os.Getenv("EASYTIER_PROXY")); ep != "" {
-		return ep
-	}
-	return defaultEasyTierSocks5Proxy
+	return easytier.ProxyEndpoint()
 }
 
 // getOrCreateMeshDialer returns a cached SOCKS5 dialer targeting the local EasyTier proxy.
@@ -141,10 +123,29 @@ func (m *meshAwareDialer) DialContext(ctx context.Context, network, addr string)
 	return m.direct.DialContext(ctx, network, addr)
 }
 
-// NewProxyDialerWithMeshSupport creates a dialer for an egress proxy URL.
+// isHTTPProxyScheme reports whether the scheme is an HTTP CONNECT proxy.
+func isHTTPProxyScheme(scheme string) bool {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http", "https":
+		return true
+	}
+	return false
+}
+
+// NewProxyDialerWithMeshSupport creates a dialer for a SOCKS proxy URL.
 // If the proxy target host is an EasyTier mesh IP, it automatically chains through
 // the local EasyTier user-space proxy.
+//
+// HTTP(S) proxies are not supported here: x/net/proxy only understands SOCKS.
+// Callers must let net/http (buildclient/pinnedclient) or meshHTTPConnectDialer
+// (tls-client) perform the CONNECT handshake instead.
 func NewProxyDialerWithMeshSupport(proxyURL *url.URL, direct *net.Dialer) (xproxy.Dialer, error) {
+	if proxyURL == nil {
+		return nil, fmt.Errorf("代理地址不能为空")
+	}
+	if isHTTPProxyScheme(proxyURL.Scheme) {
+		return nil, fmt.Errorf("HTTP(S) 代理不能通过 x/net/proxy 建立，请使用 CONNECT 拨号器")
+	}
 	if direct == nil {
 		direct = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	}

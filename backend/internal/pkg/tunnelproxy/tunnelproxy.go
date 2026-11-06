@@ -20,6 +20,7 @@ import (
 	yuhaiinvless "github.com/Asutorufa/yuhaiin/pkg/net/proxy/vless"
 	"github.com/Asutorufa/yuhaiin/pkg/net/proxy/vmess"
 	"github.com/Asutorufa/yuhaiin/pkg/protos/node/protocol"
+	"github.com/chenyme/grok2api/backend/internal/pkg/easytier"
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	singvmess "github.com/metacubex/sing-vmess"
@@ -719,8 +720,8 @@ type serverDialer struct {
 }
 
 func (d *serverDialer) Conn(ctx context.Context, _ netapi.Address) (net.Conn, error) {
-	if isMeshServerAddr(d.address) {
-		socksDialer, err := xproxy.SOCKS5("tcp", "127.0.0.1:11080", nil, newServerNetDialer())
+	if easytier.IsMeshAddr(d.address) {
+		socksDialer, err := xproxy.SOCKS5("tcp", easytier.ProxyEndpoint(), nil, newServerNetDialer())
 		if err == nil {
 			if cd, ok := socksDialer.(xproxy.ContextDialer); ok {
 				if conn, err := cd.DialContext(ctx, "tcp", d.address); err == nil {
@@ -730,19 +731,6 @@ func (d *serverDialer) Conn(ctx context.Context, _ netapi.Address) (net.Conn, er
 		}
 	}
 	return newServerNetDialer().DialContext(ctx, "tcp", d.address)
-}
-
-func isMeshServerAddr(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	ipv4 := ip.To4()
-	return ipv4 != nil && ipv4[0] == 10 && ipv4[1] == 144
 }
 
 func newServerNetDialer() *net.Dialer {

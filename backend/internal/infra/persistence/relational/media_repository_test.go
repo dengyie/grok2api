@@ -450,6 +450,64 @@ func TestMediaJobRepositoryReapsZombieJobsAndFencesStaleClaims(t *testing.T) {
 	}
 }
 
+// TestMediaJobRepositoryReaperSparesLiveLease 确认 abandon 规则只看「租约失效」
+// 的 in_progress 任务：worker 存活期间靠心跳续租，即使客户端长时间不轮询也不能
+// 被回收，否则重启后的可恢复任务会在恢复前被误杀。
+func TestMediaJobRepositoryReaperSparesLiveLease(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "reap-lease-account", SourceKey: "reap-lease-account",
+		EncryptedAccessToken: testEncryptedToken, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "reap-lease-key", Prefix: "reap-lease-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	jobRepo := NewMediaJobRepository(database)
+	now := time.Now().UTC()
+	stalePoll := now.Add(-11 * time.Minute)
+
+	liveLease := testMediaJob("media_job_reap_live_lease", accountValue.ID, key.ID, mediadomain.StatusInProgress, stalePoll)
+	liveLease.LastPolledAt = &stalePoll
+	liveLeaseUntil := now.Add(5 * time.Minute)
+	liveLease.LeaseUntil = &liveLeaseUntil
+
+	expiredLease := testMediaJob("media_job_reap_expired_lease", accountValue.ID, key.ID, mediadomain.StatusInProgress, stalePoll)
+	expiredLease.LastPolledAt = &stalePoll
+	expiredLeaseUntil := now.Add(-time.Second)
+	expiredLease.LeaseUntil = &expiredLeaseUntil
+
+	queuedOrphan := testMediaJob("media_job_reap_queued_orphan", accountValue.ID, key.ID, mediadomain.StatusQueued, stalePoll)
+
+	for _, job := range []mediadomain.Job{liveLease, expiredLease, queuedOrphan} {
+		if err := jobRepo.CreateMediaJob(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reaped, err := jobRepo.ReapStaleMediaJobs(ctx, now, time.Hour, 10*time.Minute)
+	if err != nil || reaped != 2 {
+		t.Fatalf("reaped=%d err=%v", reaped, err)
+	}
+	if survived, getErr := jobRepo.GetMediaJob(ctx, liveLease.ID, key.ID); getErr != nil || survived.Status != mediadomain.StatusInProgress {
+		t.Fatalf("live-lease job status=%v err=%v", survived.Status, getErr)
+	}
+	for _, id := range []string{expiredLease.ID, queuedOrphan.ID} {
+		value, getErr := jobRepo.GetMediaJob(ctx, id, key.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if value.Status != mediadomain.StatusFailed || value.ErrorCode != "abandoned" {
+			t.Fatalf("job %s status=%s code=%s", id, value.Status, value.ErrorCode)
+		}
+	}
+}
+
 func testMediaJob(id string, accountID, clientKeyID uint64, status mediadomain.Status, createdAt time.Time) mediadomain.Job {
 	job := mediadomain.Job{
 		ID:            id,

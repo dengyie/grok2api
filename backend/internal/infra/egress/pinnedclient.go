@@ -74,14 +74,11 @@ func newPinnedHTTPSClient(proxyURL, serverName string, tlsConfig *tls.Config) (*
 		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https":
+			// See buildclient.go: HTTP(S) proxies are handled by net/http,
+			// with only the proxy hop routed through the mesh.
+			transport.Proxy = http.ProxyURL(parsed)
 			if IsMeshAddr(parsed.Host) {
-				dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)
-				if err != nil {
-					return nil, fmt.Errorf("创建固定地址 HTTP mesh 代理: %w", err)
-				}
-				transport.DialContext = dialContext(dialer)
-			} else {
-				transport.Proxy = http.ProxyURL(parsed)
+				transport.DialContext = NewMeshAwareDialer(direct).DialContext
 			}
 		case "socks4", "socks4a", "socks5", "socks5h":
 			dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)

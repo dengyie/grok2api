@@ -757,6 +757,50 @@ func TestVideoFailureSignatureGroupsIdenticalStatus(t *testing.T) {
 	}
 }
 
+// A run of 429s from different accounts is account-scoped rate-limit churn: the
+// pool still has healthy accounts, so the breaker must not trip while the same
+// signature keeps landing on a new account. Only a stuck account (repeated same
+// account + signature) or a signature that repeats across the whole sample
+// (pool-wide rejection) may trip it.
+func TestVideoFailureStreakTrackerDistinguishesAccountChurnFromStuckAccount(t *testing.T) {
+	signature := videoFailureSignature(errVideoRateLimitedForTest(http.StatusTooManyRequests))
+
+	churn := &videoFailureStreakTracker{}
+	for accountID := uint64(1); accountID <= 6; accountID++ {
+		churn.record(accountID, signature)
+	}
+	if churn.tripped() {
+		t.Fatalf("six distinct 429 accounts tripped the breaker: same=%d churn=%d", churn.same, churn.churn)
+	}
+	if churn.same != 1 || churn.churn != 6 {
+		t.Fatalf("churn streak = same:%d churn:%d, want same:1 churn:6", churn.same, churn.churn)
+	}
+
+	stuck := &videoFailureStreakTracker{}
+	for attempt := 0; attempt < videoSameFailureBreak; attempt++ {
+		stuck.record(42, signature)
+	}
+	if !stuck.tripped() {
+		t.Fatalf("same account x%d did not trip the breaker", videoSameFailureBreak)
+	}
+
+	fleet := &videoFailureStreakTracker{}
+	for accountID := uint64(1); accountID <= videoChurnFailureBreak; accountID++ {
+		fleet.record(accountID, signature)
+	}
+	if !fleet.tripped() {
+		t.Fatalf("fleet-wide rejection across %d accounts did not trip the breaker", videoChurnFailureBreak)
+	}
+
+	mixed := &videoFailureStreakTracker{}
+	mixed.record(1, signature)
+	mixed.record(2, videoFailureSignature(errVideoRateLimitedForTest(http.StatusForbidden)))
+	mixed.record(3, signature)
+	if mixed.same != 1 || mixed.churn != 1 {
+		t.Fatalf("signature change did not reset streaks: same=%d churn=%d", mixed.same, mixed.churn)
+	}
+}
+
 func TestVideoSafeToRetryCreateAllowsPrepareTransportFailures(t *testing.T) {
 	prepareEOF := fmt.Errorf("wrapped: %w", &provider.VideoStageError{
 		Stage: provider.VideoStagePrepare,
@@ -1131,5 +1175,234 @@ func TestVideoRetryDoesNotEscapeClientKeyAccountScope(t *testing.T) {
 	}
 	if stored.Status != media.StatusFailed {
 		t.Fatalf("expected the job to fail rather than complete via an out-of-scope account, got %#v", stored)
+	}
+}
+
+// videoPostProcessingFailAdapter always fails after the upstream accepted the
+// job. That terminal path returns from inside the retry loop before the
+// success-only defer, so it exercises the account concurrency slot release.
+type videoPostProcessingFailAdapter struct{}
+
+func (videoPostProcessingFailAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (videoPostProcessingFailAdapter) Definition() provider.Definition {
+	definition := testConversationDefinition(account.ProviderWeb)
+	definition.Media.VideoGeneration = true
+	return definition
+}
+
+func (videoPostProcessingFailAdapter) GenerateVideo(_ context.Context, _ provider.VideoRequest) (provider.VideoResult, error) {
+	return provider.VideoResult{}, provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, errors.New("download failed"))
+}
+
+// TestVideoJobFailureReleasesAccountConcurrencySlot guards against a leak where
+// runVideoJob acquired the account concurrency slot inside the retry loop but
+// only released it on the success path. Every terminal failure (post-processing
+// error, poll error, ownership loss, deadline) returned before that defer, so
+// the slot stayed occupied until process restart and the account could never be
+// selected again.
+func TestVideoJobFailureReleasesAccountConcurrencySlot(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-lease-release.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	mediaRepo := relational.NewMediaJobRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "video-lease-release", Prefix: "video-lease-release", SecretHash: strings.Repeat("c", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "lease-release", SourceKey: "lease-release", EncryptedAccessToken: "lease-release-token",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+		Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-imagine-video"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-imagine-video"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	route, err := modelRepo.GetByProviderUpstream(ctx, account.ProviderWeb, "grok-imagine-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry := provider.NewRegistry(videoPostProcessingFailAdapter{})
+	sticky := memory.NewStickyStore()
+	limiter := memory.NewConcurrencyLimiter()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, limiter, sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 3)
+	service.ConfigureMedia(mediaRepo, 1)
+	service.UpdateVideoMaxAttempts(3)
+
+	now := time.Now().UTC()
+	job := media.Job{
+		ID: "video_lease_release", RequestID: "request-video-lease-release", ClientKeyID: key.ID, ClientKeyName: key.Name,
+		AccountID: credential.ID, AccountName: credential.Name, Provider: string(account.ProviderWeb),
+		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Quality: "720p",
+		Status: media.StatusInProgress, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	service.runVideoJob(ctx, job, route)
+
+	stored, err := mediaRepo.GetMediaJob(ctx, job.ID, job.ClientKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != media.StatusFailed {
+		t.Fatalf("job status = %q, want failed", stored.Status)
+	}
+	count, err := limiter.Current(ctx, repository.AccountConcurrencyKey(credential.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("account concurrency slot leaked: Current = %d, want 0", count)
+	}
+}
+
+// videoDialFailureAdapter emits the exact error chain the Web adapter produces
+// when a bound egress node is unreachable: the POST never left the process, so
+// the create request was definitively not accepted upstream.
+type videoDialFailureAdapter struct {
+	mu       sync.Mutex
+	failures map[uint64]int
+	attempts []uint64
+}
+
+func (a *videoDialFailureAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *videoDialFailureAdapter) Definition() provider.Definition {
+	definition := testConversationDefinition(account.ProviderWeb)
+	definition.Media.VideoGeneration = true
+	return definition
+}
+
+func (a *videoDialFailureAdapter) GenerateVideo(_ context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	remaining := a.failures[request.Credential.ID]
+	if remaining > 0 {
+		a.failures[request.Credential.ID] = remaining - 1
+	}
+	a.mu.Unlock()
+	if remaining > 0 {
+		dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("i/o timeout")}
+		err := fmt.Errorf(`Post "https://grok.com/rest/app-chat/conversations/new": socks connect tcp 10.144.144.12:10905->grok.com:443: %w`, dialErr)
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
+	}
+	return provider.VideoResult{AssetID: "video_asset_00001", ContentType: "video/mp4"}, nil
+}
+
+func (a *videoDialFailureAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
+
+// A dial timeout on a bound egress node means the create POST never reached
+// Grok; the job must fail over to another account instead of dying at attempt
+// one (production regression: 2/5 video jobs failed on dead mesh-nl nodes).
+func TestVideoCreateDialFailureFailsOverToHealthyAccount(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-dial-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	mediaRepo := relational.NewMediaJobRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "video-test", Prefix: "video-test", SecretHash: strings.Repeat("b", 64),
+		EncryptedSecret: "encrypted", Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createAccount := func(name string, priority int) account.Credential {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+			Name: name, SourceKey: name, EncryptedAccessToken: name + "-token", ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: priority, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return credential
+	}
+	dead := createAccount("dead-mesh-nl", 200)
+	healthy := createAccount("healthy", 100)
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-imagine-video"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []uint64{dead.ID, healthy.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, accountID, []string{"grok-imagine-video"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	route, err := modelRepo.GetByProviderUpstream(ctx, account.ProviderWeb, "grok-imagine-video")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &videoDialFailureAdapter{failures: map[uint64]int{dead.ID: 1}}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, nil, 3)
+	service.ConfigureMedia(mediaRepo, 1)
+	service.UpdateVideoMaxAttempts(10)
+
+	now := time.Now().UTC()
+	job := media.Job{
+		ID: "video_dial_failover", RequestID: "request-video-dial", ClientKeyID: key.ID, ClientKeyName: key.Name,
+		AccountID: dead.ID, AccountName: dead.Name, Provider: string(account.ProviderWeb),
+		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Quality: "720p",
+		Status: media.StatusInProgress, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	service.runVideoJob(ctx, job, route)
+
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != dead.ID || attempts[1] != healthy.ID {
+		t.Fatalf("video attempts = %#v, want dead account once then healthy account", attempts)
+	}
+	stored, err := mediaRepo.GetMediaJob(ctx, job.ID, job.ClientKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != media.StatusCompleted || stored.AccountID != healthy.ID || stored.ErrorCode != "" {
+		t.Fatalf("completed job = %#v", stored)
 	}
 }

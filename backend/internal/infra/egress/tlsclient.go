@@ -85,11 +85,17 @@ func newBrowserClient(proxyURL, userAgent string) (*browserClient, error) {
 			}
 			options = append(options, tlsclient.WithDialContext(dialer.DialContext))
 		} else if IsMeshAddr(parsed.Host) {
-			dialer, err := NewProxyDialerWithMeshSupport(parsed, nil)
-			if err != nil {
-				return nil, fmt.Errorf("创建浏览器 mesh 代理: %w", err)
+			if isHTTPProxyScheme(parsed.Scheme) {
+				// tls-client rejects WithDialContext + WithProxyUrl, so the
+				// CONNECT handshake happens inside the dialer.
+				options = append(options, tlsclient.WithDialContext(newMeshHTTPConnectDialer(parsed, nil).DialContext))
+			} else {
+				dialer, err := NewProxyDialerWithMeshSupport(parsed, nil)
+				if err != nil {
+					return nil, fmt.Errorf("创建浏览器 mesh 代理: %w", err)
+				}
+				options = append(options, tlsclient.WithDialContext(dialContext(dialer)))
 			}
-			options = append(options, tlsclient.WithDialContext(dialContext(dialer)))
 		} else {
 			options = append(options, tlsclient.WithProxyUrl(proxyURL))
 		}

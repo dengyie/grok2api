@@ -53,14 +53,13 @@ func newBuildClientWithOptions(proxyURL string, responseHeaderTimeout time.Durat
 		}
 		switch strings.ToLower(parsed.Scheme) {
 		case "http", "https":
+			// x/net/proxy only understands SOCKS, so an HTTP(S) proxy must be
+			// driven by net/http's own CONNECT handling. DialContext still
+			// routes the proxy hop through the mesh when the proxy lives on
+			// 10.144.0.0/16.
+			transport.Proxy = http.ProxyURL(parsed)
 			if IsMeshAddr(parsed.Host) {
-				dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)
-				if err != nil {
-					return nil, fmt.Errorf("创建 Grok Build HTTP mesh 代理: %w", err)
-				}
-				transport.DialContext = dialContext(dialer)
-			} else {
-				transport.Proxy = http.ProxyURL(parsed)
+				transport.DialContext = NewMeshAwareDialer(direct).DialContext
 			}
 		case "socks4", "socks4a", "socks5", "socks5h":
 			dialer, err := NewProxyDialerWithMeshSupport(parsed, direct)

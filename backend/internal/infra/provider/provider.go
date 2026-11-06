@@ -2,10 +2,12 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -156,7 +158,102 @@ func VideoCreateFailureStage(err error) VideoStage {
 	if status, ok := ErrorHTTPStatus(err); ok && status >= http.StatusBadRequest && status < http.StatusInternalServerError {
 		return VideoStageCreate
 	}
+	// A create request that never left the process (DNS failure, TCP timeout,
+	// TLS or CONNECT handshake error) cannot have created an upstream job, so it
+	// is reported as a create-stage rejection and may be retried on another
+	// credential/egress route. Failures after the request bytes were handed to
+	// the connection remain indeterminate: the server may have accepted the POST
+	// and dropped only the response.
+	if createRequestNotSent(err) {
+		return VideoStageCreate
+	}
 	return VideoStageSubmitted
+}
+
+// createRequestNotSent reports whether err proves the POST never reached a peer.
+// Only transport-level (dial/handshake) evidence qualifies; EOF, resets and
+// timeouts on an established connection do not, because the request may have
+// been written and the upstream job created by then.
+//
+// The dial-phase checks run before any context guard on purpose: a connect
+// attempt aborted by a deadline surfaces as context.DeadlineExceeded wrapped
+// inside the dial error, and that is still a "nothing was written" failure. A
+// bare context deadline without dial-phase evidence, by contrast, is
+// indeterminate — the response may have been lost after the POST was accepted.
+func createRequestNotSent(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	if hasDialPhaseOp(err) {
+		return true
+	}
+	var tlsErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsErr) {
+		return true
+	}
+	var handshakeErr tls.RecordHeaderError
+	if errors.As(err, &handshakeErr) {
+		return true
+	}
+	// SOCKS failures happen before the CONNECT succeeds, so no HTTP bytes exist
+	// yet; the wrapped dial error already covers the common cases above, and the
+	// string check keeps proxy libraries that lose the error type covered.
+	if strings.Contains(strings.ToLower(err.Error()), "socks connect tcp") {
+		return true
+	}
+	for _, marker := range []string{"proxyconnect tcp", "tls: handshake failure", "no such host"} {
+		if strings.Contains(strings.ToLower(err.Error()), marker) {
+			return true
+		}
+	}
+	// A timeout or cancellation without dial-phase evidence may have fired after
+	// the request bytes were handed to the socket; stay fail-closed.
+	return false
+}
+
+// hasDialPhaseOp walks every layer of the error chain (including errors.Join
+// branches) looking for a connect-phase OpError. The whole chain matters, not
+// just the outermost *net.OpError: x/net's SOCKS5 proxy reports its own dial
+// failure as Op="socks connect" while the real TCP connect sits one layer
+// deeper as Op="dial", and errors.As only surfaces the outermost match.
+func hasDialPhaseOp(err error) bool {
+	seen := make(map[error]bool)
+	var walk func(error) bool
+	walk = func(e error) bool {
+		if e == nil || seen[e] {
+			return false
+		}
+		seen[e] = true
+		if opErr, ok := e.(*net.OpError); ok && isDialPhaseOp(opErr.Op) {
+			return true
+		}
+		switch wrapped := e.(type) {
+		case interface{ Unwrap() error }:
+			return walk(wrapped.Unwrap())
+		case interface{ Unwrap() []error }:
+			for _, inner := range wrapped.Unwrap() {
+				if walk(inner) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(err)
+}
+
+// isDialPhaseOp reports whether Op describes the connection setup phase, i.e.
+// before any HTTP request byte could have been written to the wire.
+func isDialPhaseOp(op string) bool {
+	switch op {
+	case "dial", "proxyconnect", "socks connect":
+		return true
+	}
+	return false
 }
 
 // WrapVideoStage annotates err with the video phase and optional HTTP status.

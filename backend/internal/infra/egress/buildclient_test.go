@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +132,54 @@ func TestNewBuildClientUsesStandardTransportForEveryProxyFamily(t *testing.T) {
 func TestNewBuildClientRejectsUnsupportedProxyScheme(t *testing.T) {
 	if _, err := newBuildClient("ftp://proxy.example:21", 5*time.Minute); err == nil {
 		t.Fatal("unsupported proxy scheme was accepted")
+	}
+}
+
+// A mesh-hosted HTTP proxy used to be handed to x/net/proxy, which only
+// understands SOCKS and rejected the scheme. The transport must instead let
+// net/http perform CONNECT while the proxy hop is routed through EasyTier.
+func TestBuildClientAcceptsMeshHTTPProxy(t *testing.T) {
+	for _, raw := range []string{"http://10.144.144.3:10801", "https://10.144.144.3:10802"} {
+		t.Run(raw, func(t *testing.T) {
+			client, err := newBuildClient(raw, 5*time.Minute)
+			if err != nil {
+				t.Fatalf("mesh HTTP proxy rejected: %v", err)
+			}
+			transport := client.Transport.(*http.Transport)
+			if transport.Proxy == nil {
+				t.Fatal("HTTP proxy callback not configured")
+			}
+			if transport.DialContext == nil {
+				t.Fatal("mesh-aware dial context not configured")
+			}
+			proxyURL, err := transport.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "grok.com"}})
+			if err != nil || proxyURL == nil || proxyURL.String() != raw {
+				t.Fatalf("proxy = %v err = %v, want %s", proxyURL, err, raw)
+			}
+		})
+	}
+}
+
+func TestPinnedHTTPSClientAcceptsMeshHTTPProxy(t *testing.T) {
+	client, err := newPinnedHTTPSClient("http://10.144.144.3:10801", "grok.com", nil)
+	if err != nil {
+		t.Fatalf("mesh HTTP proxy rejected: %v", err)
+	}
+	transport := client.Transport.(*http.Transport)
+	if transport.Proxy == nil || transport.DialContext == nil {
+		t.Fatalf("mesh HTTP proxy not wired into pinned transport: %#v", transport)
+	}
+}
+
+func TestBrowserClientAcceptsMeshHTTPProxy(t *testing.T) {
+	for _, raw := range []string{"http://10.144.144.3:10801", "https://10.144.144.3:10802"} {
+		t.Run(raw, func(t *testing.T) {
+			client, err := newBrowserClient(raw, DefaultUserAgent)
+			if err != nil {
+				t.Fatalf("mesh HTTP proxy rejected: %v", err)
+			}
+			client.CloseIdleConnections()
+		})
 	}
 }
 

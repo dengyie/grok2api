@@ -1200,10 +1200,10 @@ func (s *Selector) quotaConsumptionSnapshot(provider account.Provider) map[accou
 	return result
 }
 
-// quotaWindowExhausted 判断候选账号的额度窗口是否已用尽。上游快照跨过重置时间后
+// quotaWindowExhausted 判断候选账号的额度快照是否已用尽。上游快照跨过重置时间后
 // 不再代表当前周期，必须视为未知放行：否则上一周期写下的 remaining=0 会把账号
 // 一直挡在路由之外，直到后台额度同步碰巧刷新它（与 candidateQuotaRank 保持一致）。
-// 本地在途消费仍然生效，避免同一周期内被并发超额调度。
+// 快照仍在有效周期内时，需扣减本地在途消费，避免同一周期内被并发超额调度。
 func quotaWindowExhausted(candidate account.RoutingCandidate, consumed map[accountQuotaConsumptionKey]int, now time.Time) bool {
 	if candidate.QuotaWindow == nil {
 		return false

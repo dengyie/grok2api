@@ -28,7 +28,6 @@ import (
 )
 
 const (
-	videoJobTimeout = 2 * time.Hour
 	// videoJobMaxAge 是任务从创建起的绝对存活上限。旧实现只有租约兜底（2h5m），
 	// 上游限流时 worker 会在任务内无限重试，5 个 worker 全被占满、期间无法生图生视频。
 	videoJobMaxAge = 30 * time.Minute
@@ -44,9 +43,14 @@ const (
 	videoRetryBudget      = 5 * time.Minute
 	videoRetryBackoffBase = 500 * time.Millisecond
 	videoRetryBackoffMax  = 10 * time.Second
-	// videoSameFailureBreak 表示连续同类失败达到该次数即熔断：上游整体限流时继续换账号
-	// 只会放大约束，不再空转到 attempt 上限。
+	// videoSameFailureBreak 表示同一账号连续同类失败达到该次数即熔断：账号或它绑定的
+	// 出口已卡死，继续在它身上重试必然失败。
 	videoSameFailureBreak = 5
+	// videoChurnFailureBreak 表示连续同类失败跨到该次数（不论账号）即熔断：这说明整个
+	// 账号池都被同一种上游状态拒绝。只按同账号计数时，账号侧限流抖动会让任务在 5 个
+	// 不同账号上被误杀（线上 6h 成功率仍有 82%），因此跨账号要更宽容；真整体限流则由
+	// 该阈值在约 15 次请求内快速收敛，5 分钟预算继续兜底。
+	videoChurnFailureBreak = 15
 	// videoMaxDefers 限制延迟重投次数，避免"输入槽位不足"反复入队形成的延迟循环。
 	videoMaxDefers      = 10
 	videoOutputAttempts = 3
@@ -598,9 +602,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	if job.CreatedAt.IsZero() {
 		deadline = time.Now().Add(videoJobMaxAge)
 	}
-	if limit := time.Now().Add(videoJobTimeout); limit.Before(deadline) {
-		deadline = limit
-	}
 	if !deadline.After(time.Now()) {
 		s.failVideoJob(parent, job, "expired", errVideoJobExpired, 0, nil)
 		return
@@ -682,11 +683,19 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, "/videos/generations")
 	var selection *selectionSession
 	var lease *accountLease
+	// 循环内任何早退（熔断/预算中止、所有权丢失、credential 失败、终态失败、
+	// 自身 deadline）都发生在成功路径的 defer 之前，必须在这里统一归还账号
+	// 并发槽。Release 幂等（release 置 nil + observation CAS），可与下方成功
+	// 路径的 defer lease.Release() 叠加。
+	defer func() {
+		if lease != nil {
+			lease.Release()
+		}
+	}()
 	var result provider.VideoResult
 	var lastErr error
 	retryStartedAt := time.Now()
-	lastFailureSignature := ""
-	sameFailureStreak := 0
+	var failureStreak videoFailureStreakTracker
 
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		attemptStarted := time.Now()
@@ -700,15 +709,17 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			// 上游整体限流/拒绝时换账号并不改变结果。超预算或连续同类失败即终止，
 			// 而不是按 attempt 上限空转（曾出现 8 分钟 507 次请求、5 个 worker 全被占满）。
 			overBudget := time.Since(retryStartedAt) > videoRetryBudget
-			breakerTripped := sameFailureStreak >= videoSameFailureBreak
+			breakerTripped := failureStreak.tripped()
 			if overBudget || breakerTripped {
 				code, publicErr, upstreamStatus := videoFailureDisposition(lastErr)
 				s.logger.Warn("video_job_retry_aborted", "job_id", job.ID, "attempts", attempt,
-					"same_failure_streak", sameFailureStreak, "budget_exhausted", overBudget, "breaker_tripped", breakerTripped)
+					"same_account_streak", failureStreak.same, "churn_streak", failureStreak.churn,
+					"last_failure_signature", failureStreak.lastSignature,
+					"budget_exhausted", overBudget, "breaker_tripped", breakerTripped)
 				s.failVideoJob(parent, job, code, publicErr, upstreamStatus, failureAttempts.snapshot())
 				return
 			}
-			if delay := videoRetryDelay(sameFailureStreak); delay > 0 {
+			if delay := videoRetryDelay(failureStreak.same); delay > 0 {
 				timer := time.NewTimer(delay)
 				select {
 				case <-ctx.Done():
@@ -809,14 +820,9 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 		lastErr = err
 		captureVideoAttempt(failureAttempts, lease.Credential, attemptStarted, err)
-		// 同类失败连续出现说明是上游/出口整体状态，而不是单账号问题。
-		if signature := videoFailureSignature(err); signature != "" {
-			if signature == lastFailureSignature {
-				sameFailureStreak++
-			} else {
-				lastFailureSignature, sameFailureStreak = signature, 1
-			}
-		}
+		// 同类失败连续出现说明是上游/出口整体状态，而不是单账号问题；但账号侧限流
+		// 在不同账号之间是独立的，只有"同一个账号反复同类失败"才足以断定它已卡死。
+		failureStreak.record(lease.Credential.ID, videoFailureSignature(err))
 		if ownershipLost.Load() {
 			s.logger.Warn("video_job_ownership_lost", "job_id", job.ID, "attempt", attempt)
 			return
@@ -1431,6 +1437,39 @@ func videoFailureSignature(err error) string {
 		return fmt.Sprintf("status=%d|stage=%s", status, stage)
 	}
 	return fmt.Sprintf("stage=%s|%s", stage, sanitizeDiagnosticText(err.Error(), 120))
+}
+
+// videoFailureStreakTracker 区分两类"连续同类失败"：
+//   - same：同一账号在相同签名上连续失败。账号自身或它绑定的出口已卡死，重试必败。
+//   - churn：相同签名上的连续失败总数（含换账号）。账号侧限流/风控是抖动的，不同账号
+//     之间互不影响，连续几家都不行才说明是账号池整体被上游拒绝。
+//
+// 签名变化时两者都归 1；同签名但账号改变时 churn 增长而 same 归 1。
+type videoFailureStreakTracker struct {
+	lastSignature string
+	lastAccountID uint64
+	same          int
+	churn         int
+}
+
+func (t *videoFailureStreakTracker) record(accountID uint64, signature string) {
+	if signature == "" {
+		return
+	}
+	if signature != t.lastSignature {
+		t.lastSignature, t.lastAccountID, t.same, t.churn = signature, accountID, 1, 1
+		return
+	}
+	t.churn++
+	if accountID == t.lastAccountID {
+		t.same++
+	} else {
+		t.lastAccountID, t.same = accountID, 1
+	}
+}
+
+func (t *videoFailureStreakTracker) tripped() bool {
+	return t.same >= videoSameFailureBreak || t.churn >= videoChurnFailureBreak
 }
 
 // videoSafeToRetryCreate 判断失败是否可以在"上游尚未创建视频任务"的前提下换账号重试。

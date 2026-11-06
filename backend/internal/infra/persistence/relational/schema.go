@@ -107,6 +107,10 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_client_created ON media_jobs(client_key_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_account_status ON media_jobs(account_id, status)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_recovery ON media_jobs(status, lease_until, created_at, id)",
+	// 回收器的 abandon 规则按 (status, last_polled_at) 过滤，last_polled_at IS NULL
+	// 支路回落到 created_at；没有索引时每次心跳都要全表扫活跃任务。
+	"CREATE INDEX IF NOT EXISTS idx_media_jobs_reap_polled ON media_jobs(status, last_polled_at)",
+	"CREATE INDEX IF NOT EXISTS idx_media_jobs_reap_created ON media_jobs(status, created_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_usage_recovery ON media_jobs(status, usage_recorded_at, completed_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_created ON media_assets(created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets(kind, created_at DESC, id)",

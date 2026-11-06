@@ -514,6 +514,10 @@ func (r *MediaJobRepository) TouchMediaJobPolled(ctx context.Context, id string,
 // ReapStaleMediaJobs 终结两类僵尸任务：超过最大存活时间的任务，以及客户端
 // 长期不再轮询的孤儿任务。回收时清空 claim_token，令在跑 worker 的后续写入
 // 因为围栏失败而失效，从而不会把任务改回 in_progress。
+//
+// in_progress 任务只有在租约失效（worker 已死或从未认领）且客户端停止轮询时
+// 才可回收：活着的 worker 由心跳续租，绝不能因为 last_polled_at 陈旧就被误杀，
+// 否则重启后仍可恢复的在跑任务会在恢复窗口之前被直接终结。
 func (r *MediaJobRepository) ReapStaleMediaJobs(ctx context.Context, now time.Time, maxAge, abandonAfter time.Duration) (int64, error) {
 	active := []media.Status{media.StatusQueued, media.StatusInProgress}
 	var total int64
@@ -531,17 +535,33 @@ func (r *MediaJobRepository) ReapStaleMediaJobs(ctx context.Context, now time.Ti
 		total += result.RowsAffected
 	}
 	if abandonAfter > 0 {
-		result := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
-			Where("status IN ? AND COALESCE(last_polled_at, created_at) <= ?", active, now.Add(-abandonAfter)).
+		cutoff := now.Add(-abandonAfter)
+		// 条件写成 last_polled_at IS NULL / <= cutoff 两支，避免 COALESCE
+		// 让索引失效；两种状态分开更新以保持条件可读。
+		stalePoll := "(last_polled_at IS NOT NULL AND last_polled_at <= ?) OR (last_polled_at IS NULL AND created_at <= ?)"
+		queued := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+			Where("status = ? AND ("+stalePoll+")", media.StatusQueued, cutoff, cutoff).
 			Updates(map[string]any{
 				"status": media.StatusFailed, "error_code": "abandoned",
 				"error_message": "客户端长时间未轮询，任务已被回收", "progress": 0,
 				"lease_until": nil, "claim_token": "", "completed_at": now, "updated_at": now,
 			})
-		if result.Error != nil {
-			return total, result.Error
+		if queued.Error != nil {
+			return total, queued.Error
 		}
-		total += result.RowsAffected
+		total += queued.RowsAffected
+
+		inFlight := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
+			Where("status = ? AND (lease_until IS NULL OR lease_until <= ?) AND ("+stalePoll+")", media.StatusInProgress, now, cutoff, cutoff).
+			Updates(map[string]any{
+				"status": media.StatusFailed, "error_code": "abandoned",
+				"error_message": "客户端长时间未轮询，任务已被回收", "progress": 0,
+				"lease_until": nil, "claim_token": "", "completed_at": now, "updated_at": now,
+			})
+		if inFlight.Error != nil {
+			return total, inFlight.Error
+		}
+		total += inFlight.RowsAffected
 	}
 	return total, nil
 }
