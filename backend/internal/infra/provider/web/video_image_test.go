@@ -21,17 +21,18 @@ import (
 func TestGenerateVideoFirstFrame(t *testing.T) {
 	const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 	tests := []struct {
-		name         string
-		image        string
-		references   []string
-		maxBytes     int64
-		uploadStatus int
-		uploadBody   string
-		cancelUpload bool
-		wantUploads  int32
-		wantVideo    int32
-		wantDuration int
-		basic        bool
+		name          string
+		image         string
+		references    []string
+		maxBytes      int64
+		uploadStatus  int
+		uploadBody    string
+		wantRetryable bool
+		cancelUpload  bool
+		wantUploads   int32
+		wantVideo     int32
+		wantDuration  int
+		basic         bool
 	}{
 		{name: "metadata first frame", image: image, uploadBody: `{"fileMetadata":{"fileMetadataId":"metadata-1","fileId":"wrong-file"},"uploadId":"wrong-upload"}`, wantUploads: 1, wantVideo: 1, wantDuration: 8},
 		{name: "basic duration cap", image: image, uploadBody: `{"fileMetadata":{"fileMetadataId":"metadata-1"}}`, wantUploads: 1, wantVideo: 1, wantDuration: 6, basic: true},
@@ -39,6 +40,8 @@ func TestGenerateVideoFirstFrame(t *testing.T) {
 		{name: "oversized image", image: image, maxBytes: 8},
 		{name: "reference list rejected", image: image, references: []string{image}},
 		{name: "upload rejected", image: image, uploadStatus: 503, uploadBody: `{"error":{"message":"upload unavailable"}}`, wantUploads: 1},
+		{name: "upload challenge", image: image, uploadStatus: 403, uploadBody: `<!doctype html><title>Just a moment...</title>`, wantUploads: 1, wantRetryable: true},
+		{name: "upload moderation", image: image, uploadStatus: 403, uploadBody: `{"error":{"code":"content-moderated","message":"rejected"}}`, wantUploads: 1},
 		{name: "file ID is not metadata", image: image, uploadBody: `{"fileMetadata":{"fileId":"wrong-file"}}`, wantUploads: 1},
 		{name: "upload ID is not metadata", image: image, uploadBody: `{"uploadId":"wrong-upload"}`, wantUploads: 1},
 		{name: "cancel during upload", image: image, uploadBody: `{"fileMetadata":{"fileMetadataId":"metadata-1"}}`, cancelUpload: true, wantUploads: 1},
@@ -142,6 +145,11 @@ func TestGenerateVideoFirstFrame(t *testing.T) {
 				}
 				if stage, ok := provider.VideoErrorStage(err); !ok || stage != provider.VideoStagePrepare {
 					t.Errorf("preparation stage = %v: %v", stage, err)
+				}
+				var retryable interface{ VideoPreparationRetryable() bool }
+				gotRetryable := errors.As(err, &retryable) && retryable.VideoPreparationRetryable()
+				if gotRetryable != test.wantRetryable {
+					t.Errorf("retryable=%v, want %v", gotRetryable, test.wantRetryable)
 				}
 				if test.cancelUpload && !errors.Is(err, context.Canceled) {
 					t.Errorf("cancellation lost: %v", err)

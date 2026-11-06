@@ -1473,8 +1473,8 @@ func (t *videoFailureStreakTracker) tripped() bool {
 }
 
 // videoSafeToRetryCreate 判断失败是否可以在"上游尚未创建视频任务"的前提下换账号重试。
-// create 阶段天然可重试；prepare 阶段（下载首帧、上传素材）只有传输层中断才放宽——
-// 此前一律 fail-closed，一次 EOF 就会白白废掉整个 i2v 任务。
+// create 阶段由后续状态码策略控制；prepare 阶段只放行传输失败或 Provider
+// 已识别的上传质询。此时尚未创建视频，结构化业务拒绝仍保持 fail-closed。
 func videoSafeToRetryCreate(stage provider.VideoStage, hasStage bool, err error) bool {
 	if !hasStage {
 		return false
@@ -1482,7 +1482,14 @@ func videoSafeToRetryCreate(stage provider.VideoStage, hasStage bool, err error)
 	if stage == provider.VideoStageCreate {
 		return true
 	}
-	return stage == provider.VideoStagePrepare && videoTransportFailure(err)
+	if stage != provider.VideoStagePrepare {
+		return false
+	}
+	var challenge interface{ VideoPreparationRetryable() bool }
+	if errors.As(err, &challenge) && challenge.VideoPreparationRetryable() {
+		return true
+	}
+	return videoTransportFailure(err)
 }
 
 // videoTransportFailure 判断错误是否只是"连接没走完"：EOF、连接重置、超时。

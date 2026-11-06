@@ -891,6 +891,7 @@ func TestVideoAttemptPolicyStandaloneAndUnlimited(t *testing.T) {
 }
 
 type videoCreateFailoverAdapter struct {
+	failure  error
 	mu       sync.Mutex
 	failures map[uint64]int
 	status   int
@@ -914,6 +915,9 @@ func (a *videoCreateFailoverAdapter) GenerateVideo(_ context.Context, request pr
 	}
 	a.mu.Unlock()
 	if remaining > 0 {
+		if a.failure != nil {
+			return provider.VideoResult{}, a.failure
+		}
 		if a.status == 0 {
 			return provider.VideoResult{}, errors.New("unclassified create failure")
 		}
@@ -934,6 +938,15 @@ func (e videoHTTPStatusError) Error() string       { return http.StatusText(e.st
 func (e videoHTTPStatusError) HTTPStatusCode() int { return e.status }
 
 func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
+	testVideoWebForbiddenFailover(t, nil)
+}
+
+func TestVideoUploadChallengeRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
+	testVideoWebForbiddenFailover(t, provider.WrapVideoStage(provider.VideoStagePrepare, 0, videoPreparationChallengeError{retryable: true}))
+}
+
+func testVideoWebForbiddenFailover(t *testing.T, failure error) {
+	t.Helper()
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-retry.db"))
 	if err != nil {
@@ -983,6 +996,7 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	}
 
 	adapter := &videoCreateFailoverAdapter{
+		failure:  failure,
 		failures: map[uint64]int{first.ID: 2},
 		status:   http.StatusForbidden,
 	}
@@ -1021,6 +1035,7 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	adapter.mu.Lock()
 	adapter.failures = map[uint64]int{first.ID: 1}
 	adapter.status = 0
+	adapter.failure = nil
 	adapter.attempts = nil
 	adapter.mu.Unlock()
 	unknownJob := job
@@ -1404,5 +1419,34 @@ func TestVideoCreateDialFailureFailsOverToHealthyAccount(t *testing.T) {
 	}
 	if stored.Status != media.StatusCompleted || stored.AccountID != healthy.ID || stored.ErrorCode != "" {
 		t.Fatalf("completed job = %#v", stored)
+	}
+}
+
+// Provider evidence for an upload challenge cannot authorize replay of work
+// that may already have been submitted or a deterministic policy rejection.
+type videoPreparationChallengeError struct{ retryable bool }
+
+func (e videoPreparationChallengeError) Error() string                   { return "upload rejected" }
+func (e videoPreparationChallengeError) HTTPStatusCode() int             { return http.StatusForbidden }
+func (e videoPreparationChallengeError) VideoPreparationRetryable() bool { return e.retryable }
+
+func TestVideoSafeToRetryRecognizedUploadChallenge(t *testing.T) {
+	for _, test := range []struct {
+		name                        string
+		stage                       provider.VideoStage
+		attributed, challenge, want bool
+	}{
+		{"upload challenge", provider.VideoStagePrepare, true, true, true},
+		{"upload policy rejection", provider.VideoStagePrepare, true, false, false},
+		{"already submitted", provider.VideoStageSubmitted, true, true, false},
+		{"already polling", provider.VideoStagePoll, true, true, false},
+		{"no stage", provider.VideoStagePrepare, false, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := fmt.Errorf("wrapped: %w", &provider.VideoStageError{Stage: test.stage, Err: videoPreparationChallengeError{retryable: test.challenge}})
+			if got := videoSafeToRetryCreate(test.stage, test.attributed, err); got != test.want {
+				t.Fatalf("retryable=%v, want %v", got, test.want)
+			}
+		})
 	}
 }
