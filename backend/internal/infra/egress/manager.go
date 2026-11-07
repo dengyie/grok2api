@@ -162,6 +162,7 @@ type Manager struct {
 	failureProbeMu         sync.Mutex
 	failureProber          FailureProber
 	failureProbes          map[uint64]failureProbeState
+	probeLog               probeLogThrottle
 	lastClientCleanup      time.Time
 	clearanceLoads         singleflight.Group
 	clearanceConfig        ClearanceConfig
@@ -614,7 +615,13 @@ func (m *Manager) logProbeSetupFailure(ctx context.Context, node domain.Node, pr
 	if err != nil {
 		attributes = append(attributes, "error", sanitizeFlareSolverrMessage(err.Error()))
 	}
-	m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+	// A node whose proxy config keeps failing is a steady state, not an event.
+	// Report the transition once; keep the repeats only for debugging.
+	if m.probeLog.shouldLogFailure(node.ID, "all") {
+		m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+		return
+	}
+	m.log().DebugContext(ctx, "egress_probe_failed", attributes...)
 }
 
 func probeEndpoints(provider domain.ProbeProvider) (string, string) {
@@ -673,9 +680,18 @@ func (m *Manager) probeEgressEndpoint(ctx context.Context, target preparedEgress
 			if probeErr != nil {
 				attributes = append(attributes, "error", sanitizeFlareSolverrMessage(probeErr.Error()))
 			}
-			m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+			// An egress that stays down would otherwise re-log this identical
+			// failure on every probe cycle and bury real transitions. Keyed by
+			// node and family so a healthy IPv4 does not mask an IPv6 failure.
+			if m.probeLog.shouldLogFailure(target.nodeID, family) {
+				m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+			} else {
+				m.log().DebugContext(ctx, "egress_probe_failed", attributes...)
+			}
 			return
 		}
+		// Record the recovery so the next failure is announced again.
+		m.probeLog.observeSuccess(target.nodeID, family)
 		attributes = append(attributes, "latency_ms", result.LatencyMS, "exit_ip", result.ExitIP)
 		m.log().InfoContext(ctx, "egress_probe_succeeded", attributes...)
 	}()
