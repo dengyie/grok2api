@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -97,5 +98,130 @@ func TestGenerateVideoReportsDeadEgressNode(t *testing.T) {
 	repository.mu.Unlock()
 	if failureCount < 1 || !cooldownSet {
 		t.Fatalf("dead egress node was not cooled: failureCount=%d cooldown=%v", failureCount, cooldownSet)
+	}
+}
+
+// stallingProxy is a minimal SOCKS5 server (no auth) that accepts every CONNECT
+// and then never forwards a byte. A client talking to it has provably completed
+// dialing — the connection and the SOCKS handshake both succeeded — and only
+// stalls waiting for the peer's response, which is how a slow but healthy egress
+// looks to the create path.
+func stallingProxy(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				// version + methods.
+				head := make([]byte, 2)
+				if _, err := io.ReadFull(conn, head); err != nil {
+					return
+				}
+				if _, err := io.ReadFull(conn, make([]byte, int(head[1]))); err != nil {
+					return
+				}
+				if _, err := conn.Write([]byte{5, 0}); err != nil {
+					return
+				}
+				// version + connect + reserved + address type.
+				request := make([]byte, 4)
+				if _, err := io.ReadFull(conn, request); err != nil {
+					return
+				}
+				switch request[3] {
+				case 1:
+					var addr [4]byte
+					if _, err := io.ReadFull(conn, addr[:]); err != nil {
+						return
+					}
+				case 3:
+					var length [1]byte
+					if _, err := io.ReadFull(conn, length[:]); err != nil {
+						return
+					}
+					if _, err := io.ReadFull(conn, make([]byte, int(length[0]))); err != nil {
+						return
+					}
+				case 4:
+					var addr [16]byte
+					if _, err := io.ReadFull(conn, addr[:]); err != nil {
+						return
+					}
+				default:
+					return
+				}
+				if _, err := io.ReadFull(conn, make([]byte, 2)); err != nil {
+					return
+				}
+				// Command succeeded; the dial is now complete as far as the client knows.
+				if _, err := conn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+					return
+				}
+				// Swallow the request and never answer: the client can only time out
+				// waiting for response headers.
+				_, _ = io.Copy(io.Discard, conn)
+			}(conn)
+		}
+	}()
+	return "socks5://" + listener.Addr().String()
+}
+
+// A create that got past dialing and merely timed out waiting for the peer says
+// nothing about the proxy. Cooling the node for that would trade a working exit
+// for one slow upstream response and drain the pool under load, so this path must
+// stay silent while a genuine dead egress (see TestGenerateVideoReportsDeadEgressNode)
+// still reports.
+func TestGenerateVideoSlowUpstreamDoesNotCoolEgressNode(t *testing.T) {
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedProxy, err := cipher.Encrypt(stallingProxy(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &videoFeedbackRepository{node: egressdomain.Node{
+		ID: 8, Name: "slow-node", Scope: egressdomain.ScopeWeb, Enabled: true,
+		Health: 1, EncryptedProxyURL: encryptedProxy,
+	}}
+	adapter := NewAdapter(Config{
+		BaseURL: "http://example.invalid", StatsigMode: "manual", StatsigManualValue: "test",
+		VideoTimeoutSeconds: 2,
+	}, infraegress.NewManager(repository, cipher), cipher, nil, nil)
+
+	startedAt := time.Now()
+	_, err = adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Credential: account.Credential{
+			ID: 2, Provider: account.ProviderWeb, WebTier: account.WebTierBasic,
+			EncryptedAccessToken: token, EgressNodeID: 8,
+		},
+		Prompt: "slow upstream probe", Duration: 6,
+	})
+	repository.mu.Lock()
+	failureCount, cooldownSet := repository.failureCount, repository.cooldownSet
+	repository.mu.Unlock()
+
+	stalledAtHeaders := err != nil && time.Since(startedAt) >= time.Second
+	if !stalledAtHeaders {
+		t.Fatalf("create did not stall at response headers as intended: err=%v elapsed=%s", err, time.Since(startedAt))
+	}
+	if provider.VideoCreateFailureStage(err) != provider.VideoStageSubmitted {
+		t.Fatalf("precondition failed: a connected-but-slow create must be indeterminate, not a create failure: %v", err)
+	}
+	if failureCount != 0 || cooldownSet {
+		t.Fatalf("slow upstream cooled a healthy node: failureCount=%d cooldown=%v", failureCount, cooldownSet)
 	}
 }

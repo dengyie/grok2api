@@ -307,11 +307,17 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
-		// A create POST that never reached the peer is a dead-egress symptom. Without
-		// this feedback the node stays healthy and its sticky accounts keep paying the
-		// dial timeout on every attempt instead of falling back to a working node.
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
+		stage := provider.VideoCreateFailureStage(err)
+		// A create POST that provably never reached the peer is a dead-egress symptom.
+		// Without this feedback the node stays healthy and its sticky accounts keep
+		// paying the dial timeout on every attempt instead of falling back to a working
+		// node. A request that got past dialing and merely timed out waiting for
+		// upstream headers says nothing about the proxy, so reporting it would cool a
+		// healthy node and surrender capacity: only VideoStageCreate qualifies.
+		if stage == provider.VideoStageCreate {
+			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		}
+		return provider.VideoResult{}, provider.WrapVideoStage(stage, 0, err)
 	}
 	result, _, parseErr := parseVideoStream(response, request.Progress)
 	status := response.StatusCode

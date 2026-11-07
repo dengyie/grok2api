@@ -690,8 +690,12 @@ func (m *Manager) probeEgressEndpoint(ctx context.Context, target preparedEgress
 			}
 			return
 		}
-		// Record the recovery so the next failure is announced again.
+		// Record the recovery so the next failure is announced again. Setup
+		// failures are keyed separately from address families, and a probe that
+		// reaches this point got past setup, so clear that key too; otherwise a
+		// config that breaks, recovers and breaks again would only ever warn once.
 		m.probeLog.observeSuccess(target.nodeID, family)
+		m.probeLog.observeSuccess(target.nodeID, "all")
 		attributes = append(attributes, "latency_ms", result.LatencyMS, "exit_ip", result.ExitIP)
 		m.log().InfoContext(ctx, "egress_probe_succeeded", attributes...)
 	}()
