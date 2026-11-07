@@ -307,16 +307,27 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
+		// A create POST that never reached the peer is a dead-egress symptom. Without
+		// this feedback the node stays healthy and its sticky accounts keep paying the
+		// dial timeout on every attempt instead of falling back to a working node.
+		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
 	result, _, parseErr := parseVideoStream(response, request.Progress)
+	status := response.StatusCode
 	_ = response.Body.Close()
 	if parseErr != nil {
 		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
 			a.logWebMediaUpstreamRejection("video_generation", response, upstreamErr)
 		}
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			// A rejection status describes the upstream response, not the proxy; 403
+			// still cools anti-bot egress inside Feedback, while 401/429/5xx are
+			// handled without touching node health.
+			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, nil)
+		}
 		stage := provider.VideoStagePoll
-		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
 			stage = provider.VideoCreateFailureStage(parseErr)
 		}
 		return provider.VideoResult{}, provider.WrapVideoStage(stage, 0, parseErr)
@@ -324,6 +335,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if result.URL == "" {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePoll, 0, fmt.Errorf("视频生成完成但没有返回内容 URL"))
 	}
+	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
 	return result, nil
 }
 
