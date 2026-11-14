@@ -353,6 +353,102 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 	return rows, err
 }
 
+// SummarizeWebImaginePool 按组统计视频/图像产品额度池。核心口径：
+//   - weekly 或组内任一产品窗口 fresh-available 即认为账号可用（付费池共用 weekly）；
+//   - 快照龄期超过 staleAfter 的窗口不作为可信证据（双向失真教训）；
+//   - 组内所有窗口都耗尽且都过期的账号计入 Unknown，交给探测层确认。
+func (r *AccountRepository) SummarizeWebImaginePool(ctx context.Context, staleAfter time.Duration, now time.Time) (account.WebImaginePoolStats, error) {
+	stats := account.WebImaginePoolStats{}
+	var credentials []struct {
+		ID      uint64
+		Enabled bool
+		Auth    account.AuthStatus `gorm:"column:auth_status"`
+	}
+	if err := r.db.db.WithContext(ctx).
+		Table("provider_accounts").
+		Select("id, enabled, auth_status").
+		Where("provider = ?", account.ProviderWeb).
+		Find(&credentials).Error; err != nil {
+		return stats, err
+	}
+	stats.Total = len(credentials)
+	if len(credentials) == 0 {
+		return stats, nil
+	}
+	type windowRow struct {
+		AccountID uint64
+		Mode      string
+		Remaining int
+		ResetAt   *time.Time
+		SyncedAt  *time.Time
+		Source    string
+	}
+	var windows []windowRow
+	if err := r.db.db.WithContext(ctx).
+		Table("account_quota_windows").
+		Select("account_id, mode, remaining, reset_at, synced_at, source").
+		Where("mode IN ?", append(account.WebImagineQuotaModes(), "weekly")).
+		Find(&windows).Error; err != nil {
+		return stats, err
+	}
+	type aggregate struct {
+		freshAvailable bool
+		exhaustedKnown bool
+		hasAnyWindow   bool
+		anyFresh       bool
+		earliestReset  *time.Time
+	}
+	byAccount := make(map[uint64]*aggregate, len(credentials))
+	for index := range windows {
+		row := windows[index]
+		value := byAccount[row.AccountID]
+		if value == nil {
+			value = &aggregate{}
+			byAccount[row.AccountID] = value
+		}
+		value.hasAnyWindow = true
+		fresh := row.Source == string(account.QuotaSourceUpstream) && row.SyncedAt != nil && staleAfter > 0 && now.Sub(*row.SyncedAt) <= staleAfter
+		// 已过 reset_at 的窗口属于旧周期，不作为证据。
+		if row.ResetAt != nil && !now.Before(*row.ResetAt) {
+			fresh = false
+		}
+		if fresh {
+			value.anyFresh = true
+			if row.Remaining > 0 {
+				value.freshAvailable = true
+			} else {
+				value.exhaustedKnown = true
+				if row.ResetAt != nil && (value.earliestReset == nil || row.ResetAt.Before(*value.earliestReset)) {
+					resetCopy := *row.ResetAt
+					value.earliestReset = &resetCopy
+				}
+			}
+		}
+	}
+	for _, credential := range credentials {
+		if !credential.Enabled || credential.Auth != account.AuthStatusActive {
+			continue
+		}
+		value := byAccount[credential.ID]
+		switch {
+		case value == nil || !value.anyFresh:
+			// 没有任何可信快照：可能是从未同步，也可能是快照全部过期。
+			stats.Unknown++
+		case value.freshAvailable:
+			stats.FreshAvailable++
+		case value.exhaustedKnown:
+			stats.ExhaustedKnown++
+			if value.earliestReset != nil && (stats.EarliestReset == nil || value.earliestReset.Before(*stats.EarliestReset)) {
+				resetCopy := *value.earliestReset
+				stats.EarliestReset = &resetCopy
+			}
+		default:
+			stats.Unknown++
+		}
+	}
+	return stats, nil
+}
+
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
 func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
 	values, err := r.listRoutingCredentials(ctx, provider)

@@ -330,6 +330,18 @@ func IsWebImagineQuotaMode(mode string) bool {
 }
 
 // QuotaWindow 表示 Provider 单个模式的额度窗口。
+// WebImaginePoolStats 汇总一个 Web Imagine 额度组在全部可调度账号上的状态，
+// 供受理路径零上游调用快断使用。FreshAvailable 只统计龄期不超过 staleAfter 的
+// upstream 快照且 remaining>0；Unknown 统计没有任何可信快照的账号；EarliestReset
+// 是耗尽窗口里最早的 reset_at，用作恢复 ETA。
+type WebImaginePoolStats struct {
+	Total          int
+	FreshAvailable int
+	ExhaustedKnown int
+	Unknown        int
+	EarliestReset  *time.Time
+}
+
 type QuotaWindow struct {
 	AccountID     uint64
 	Mode          string

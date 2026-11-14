@@ -2955,6 +2955,28 @@ func (s *Service) HasQuotaWindows(ctx context.Context, id uint64) (bool, error) 
 	return s.accounts.HasQuotaWindows(ctx, id)
 }
 
+// webImaginePoolReader 是池级额度统计的可选仓库能力，用于受理路径快断。
+type webImaginePoolReader interface {
+	SummarizeWebImaginePool(ctx context.Context, staleAfter time.Duration, now time.Time) (WebImaginePoolStats, error)
+}
+
+// WebImaginePoolStats 是 SummarizeWebImaginePool 的返回结构（导出以便网关层消费）。
+// 领域层单一来源，别名保证 repo 实现与 webImaginePoolReader 接口签名一致。
+type WebImaginePoolStats = accountdomain.WebImaginePoolStats
+
+// SummarizeWebImaginePool 统计 Web Imagine 额度组池状态；仓库不支持时返回
+// Unknown=1（视为存在不确定账号，不触发快断）。
+func (s *Service) SummarizeWebImaginePool(ctx context.Context, staleAfter time.Duration, now time.Time) (WebImaginePoolStats, error) {
+	if reader, ok := s.accounts.(webImaginePoolReader); ok {
+		stats, err := reader.SummarizeWebImaginePool(ctx, staleAfter, now)
+		if err != nil {
+			return WebImaginePoolStats{}, err
+		}
+		return WebImaginePoolStats(stats), nil
+	}
+	return WebImaginePoolStats{Total: 1, Unknown: 1}, nil
+}
+
 func (s *Service) DecrementQuota(ctx context.Context, id uint64, mode string, amount int) (bool, error) {
 	if amount <= 0 {
 		amount = 1

@@ -32,10 +32,16 @@ const (
 	quotaRankAvailable
 )
 
+// quotaSnapshotStaleAfter 默认快照可信时长：窗口本身 24h，龄期超过窗口的
+// 快照不可信（11-14 事故中 5 天前的 remaining=1 快照被当真，全池优先调度必败账号）。
+const quotaSnapshotStaleAfter = 24 * time.Hour
+
 // candidateQuotaRank 把额度快照折算成排序档位。已知耗尽必须排在未知之后：
 // 否则 429 之后被本地标记为耗尽的账号会长期压过从未同步过额度的账号，
 // 每轮都先撞一次 429 才轮到可能还有额度的号。
-func candidateQuotaRank(candidate account.RoutingCandidate, now time.Time) int {
+// 快照龄期超过 quotaStaleAfter 时同样降为未知：双向失真（陈旧 0 值曾实际可用、
+// 陈旧 1 值实际耗尽）说明旧快照既不能证明可用也不能证明耗尽，只配当兜底。
+func candidateQuotaRank(candidate account.RoutingCandidate, now time.Time, staleAfter time.Duration) int {
 	window := candidate.QuotaWindow
 	if window == nil || window.Source != account.QuotaSourceUpstream {
 		return quotaRankUnknown
@@ -44,10 +50,24 @@ func candidateQuotaRank(candidate account.RoutingCandidate, now time.Time) int {
 		// 窗口已经跨过重置时间，本地快照不再代表当前周期。
 		return quotaRankUnknown
 	}
+	if window.SyncedAt != nil && staleAfter > 0 && now.Sub(*window.SyncedAt) > staleAfter {
+		// 快照龄期超过可信窗口，remaining 值不再代表当前状态。
+		return quotaRankUnknown
+	}
 	if window.Remaining > 0 {
 		return quotaRankAvailable
 	}
 	return quotaRankExhausted
+}
+
+// selectorQuotaStaleAfter 读取当前生效的快照可信窗口；未配置或非法时用默认值。
+func (s *Selector) selectorQuotaStaleAfter() time.Duration {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	if s.quotaStaleAfter > 0 {
+		return s.quotaStaleAfter
+	}
+	return quotaSnapshotStaleAfter
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -224,7 +244,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		}
 		// 只有真实上游快照能够证明账号具备该模式额度。历史默认值和
 		// 本地预测值都属于未知能力，只保留为路由兜底。
-		score.quotaRank = candidateQuotaRank(candidate, now)
+		score.quotaRank = candidateQuotaRank(candidate, now, s.selectorQuotaStaleAfter())
 		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute

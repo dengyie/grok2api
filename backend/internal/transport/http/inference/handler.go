@@ -2329,6 +2329,17 @@ func writeGatewayError(c *gin.Context, err error) {
 		status, code = http.StatusBadRequest, "unsupported_model"
 		message = err.Error()
 	case errors.As(err, &upstreamFailure):
+		if upstreamFailure.Code == "pool_quota_exhausted" && upstreamFailure.HTTPStatus == http.StatusTooManyRequests {
+			// 受理路径全池额度快断：透传 429 + pool_quota_exhausted + ETA，
+			// 不走账号级 sanitize（这不是单账号问题，503 会误导客户端重试节奏）。
+			status, code, message = upstreamFailure.HTTPStatus, upstreamFailure.Code, upstreamFailure.PublicMessage
+			if poolErr := (*gateway.MediaPoolQuotaError)(nil); errors.As(upstreamFailure.Cause, &poolErr) {
+				seconds := max(int64(1), int64(time.Until(poolErr.EarliestReset)/time.Second))
+				c.Header("Retry-After", strconv.FormatInt(seconds, 10))
+			}
+			writeOpenAIError(c, status, code, message)
+			return
+		}
 		if isSanitizedUpstreamAvailabilityFailure(upstreamFailure) {
 			// Gateway mid-tier behavior: never expose upstream upgrade/billing prompts to clients.
 			code = upstreamFailure.ClientCredentialErrorCode()

@@ -243,6 +243,15 @@ type RoutingConfig struct {
 	// capacity/rebalance repair. GROK2API_AUTO_ASSIGN_MAX_MIGRATION_SHARE
 	// overrides this field when set to a valid value.
 	AutoAssignMaxMigrationShare float64 `yaml:"autoAssignMaxMigrationShare"`
+	// QuotaStaleAfter 过了该时长的上游额度快照不再参与 available 排序：
+	// 快照龄期超过窗口本身（默认 24h）就不可信，降级为 unknown 交给探测。
+	QuotaStaleAfter Duration `yaml:"quotaStaleAfter"`
+	// VideoProbeBudget 单个视频任务在 create 之前允许的额度探测跳过上限，
+	// 连续超限说明账号池或出口整体不健康，任务直接失败而不是继续空转。
+	VideoProbeBudget int `yaml:"videoProbeBudget"`
+	// PoolQuotaFailFast 启用受理时全池额度快断：没有任何 fresh-available 且
+	// 没有 unknown 账号时直接 429，不再逐账号烧 create。
+	PoolQuotaFailFast bool `yaml:"poolQuotaFailFast"`
 }
 
 type AuditConfig struct {
@@ -694,6 +703,12 @@ func (c Config) Validate() error {
 	if !validAutoAssignShare(c.Routing.AutoAssignMaxNodeShare) || !validAutoAssignShare(c.Routing.AutoAssignMaxMigrationShare) {
 		return errors.New("routing.autoAssignMaxNodeShare 与 autoAssignMaxMigrationShare 必须为 0 或 0.05 到 1 之间")
 	}
+	if c.Routing.QuotaStaleAfter.Value() < 0 || c.Routing.QuotaStaleAfter.Value() > 7*24*time.Hour {
+		return errors.New("routing.quotaStaleAfter 必须在 0（使用内置默认）到 7 天之间")
+	}
+	if c.Routing.VideoProbeBudget < 0 || c.Routing.VideoProbeBudget > 1000 {
+		return errors.New("routing.videoProbeBudget 必须在 0（使用内置默认）到 1000 之间")
+	}
 	if c.Audit.BufferSize < 1 || c.Audit.BufferSize > maxAuditBufferSize || c.Audit.BatchSize < 1 || c.Audit.BatchSize > maxAuditBatchSize || c.Audit.BatchSize > c.Audit.BufferSize || c.Audit.FlushInterval.Value() < minAuditFlushInterval || c.Audit.FlushInterval.Value() > maxAuditFlushInterval {
 		return errors.New("audit 队列和批量写入配置无效")
 	}
@@ -947,6 +962,9 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:      true,
 			ReasoningReplayTTL:          Duration(time.Hour),
 			ReasoningReplayMaxEntries:   10240,
+			QuotaStaleAfter:             Duration(24 * time.Hour),
+			VideoProbeBudget:            8,
+			PoolQuotaFailFast:           true,
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),

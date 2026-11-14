@@ -85,7 +85,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 			}
 		} else {
 			concurrencyHints := make(map[int]int, min(len(indexes), request.windowSize*segmentedWindowsBeforeFullFallback))
-			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild, request.cursor, request.windowSize, segmentedWindowsBeforeFullFallback)
+			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild, request.cursor, request.windowSize, segmentedWindowsBeforeFullFallback, s.selectorQuotaStaleAfter())
 			roundWindows := 0
 			fallbackToFull := false
 			for cohortIndex, bucket := range cohorts {
@@ -187,7 +187,7 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 	return result, nil
 }
 
-func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool, cursor uint64, windowSize, maxWindows int) []segmentedSelectorCohortBucket {
+func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool, cursor uint64, windowSize, maxWindows int, staleAfter time.Duration) []segmentedSelectorCohortBucket {
 	if windowSize <= 0 || maxWindows <= 0 {
 		return nil
 	}
@@ -201,7 +201,7 @@ func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int,
 			supportsModel: supportsModel, capabilityKnown: capabilityKnown,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
 			tier:            tierOrderRank(tierOrder, candidate.Credential.WebTier), priority: candidate.Credential.Priority,
-			quotaRank: candidateQuotaRank(candidate, now),
+			quotaRank: candidateQuotaRank(candidate, now, staleAfter),
 		}
 		if candidate.Billing != nil {
 			cohort.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute

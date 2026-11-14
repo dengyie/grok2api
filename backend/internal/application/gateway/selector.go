@@ -33,6 +33,15 @@ type accountLease struct {
 	release             func()
 }
 
+// routingCandidateQuotaWindow 暴露选号时命中的额度窗口，供消费方判断快照
+// 可信度；sticky/pinned 命中路径未回填时返回 nil（视为可信，走原有硬过滤）。
+func (l *accountLease) routingCandidateQuotaWindow() *account.QuotaWindow {
+	if l == nil || l.routingCandidate == nil {
+		return nil
+	}
+	return l.routingCandidate.QuotaWindow
+}
+
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
 
@@ -350,6 +359,7 @@ type Selector struct {
 	cooldownBase           time.Duration
 	cooldownMax            time.Duration
 	capacityWait           time.Duration
+	quotaStaleAfter        time.Duration
 	preferFreeBuild        bool
 	excludeBuildBotFlagged bool
 	segmentedConfig        segmentedSelectorConfig
@@ -409,6 +419,13 @@ func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Durati
 	if len(capacityWait) > 0 {
 		s.capacityWait = max(time.Duration(0), capacityWait[0])
 	}
+	s.configMu.Unlock()
+}
+
+// UpdateQuotaStaleAfter 热更新额度快照可信窗口。0 表示使用内置默认值。
+func (s *Selector) UpdateQuotaStaleAfter(value time.Duration) {
+	s.configMu.Lock()
+	s.quotaStaleAfter = value
 	s.configMu.Unlock()
 }
 

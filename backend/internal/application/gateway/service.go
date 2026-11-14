@@ -208,6 +208,7 @@ type Service struct {
 	responses                   repository.ResponseRepository
 	maxAttempts                 atomic.Int64
 	videoMaxAttempts            atomic.Int64
+	videoProbeBudget            atomic.Int64
 	buildForbiddenReauth        atomic.Pointer[buildForbiddenReauthPolicy]
 	requestTimeout              atomic.Int64
 	mediaJobs                   repository.MediaJobRepository
@@ -227,6 +228,9 @@ type Service struct {
 	modelSyncMu                 sync.Mutex
 	modelSyncing                map[uint64]struct{}
 	markBuildChatDeniedAsReauth atomic.Bool
+	poolQuotaFailFast           atomic.Bool
+	poolQuotaCacheMu            sync.Mutex
+	poolQuotaCacheStats         *poolQuotaStats
 	qualityRetry                atomic.Pointer[QualityRetryRuntime]
 }
 
@@ -478,6 +482,115 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 // 0 is treated as the general default pool size for legacy configs.
 func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
 	s.videoMaxAttempts.Store(int64(maxAttempts))
+}
+
+// poolQuotaStats 是全池额度快断的判定快照：FreshAvailable/Unknown 任一大于 0
+// 都放行（分别交给正常调度与探测层）；全 0 时用 EarliestReset 作为恢复 ETA。
+type poolQuotaStats struct {
+	Total          int
+	FreshAvailable int
+	ExhaustedKnown int
+	Unknown        int
+	EarliestReset  *time.Time
+	CachedAt       time.Time
+}
+
+const poolQuotaCacheTTL = 15 * time.Second
+const poolQuotaStaleAfter = 24 * time.Hour
+
+// poolQuotaSnapshot 返回带 TTL 缓存的池统计。缓存命中时零数据库查询，
+// 未命中时一次聚合 SQL；受理路径不需要精确到秒的数据，15s 的滞后可以接受。
+func (s *Service) poolQuotaSnapshot(ctx context.Context) (poolQuotaStats, error) {
+	s.poolQuotaCacheMu.Lock()
+	cached := s.poolQuotaCacheStats
+	if cached != nil && time.Since(cached.CachedAt) < poolQuotaCacheTTL {
+		s.poolQuotaCacheMu.Unlock()
+		return *cached, nil
+	}
+	s.poolQuotaCacheMu.Unlock()
+	stats, err := s.summarizeImaginePool(ctx)
+	if err != nil {
+		return poolQuotaStats{}, err
+	}
+	snapshot := poolQuotaStats{
+		Total: stats.Total, FreshAvailable: stats.FreshAvailable,
+		ExhaustedKnown: stats.ExhaustedKnown, Unknown: stats.Unknown,
+		EarliestReset: stats.EarliestReset, CachedAt: time.Now().UTC(),
+	}
+	s.poolQuotaCacheMu.Lock()
+	s.poolQuotaCacheStats = &snapshot
+	s.poolQuotaCacheMu.Unlock()
+	return snapshot, nil
+}
+
+// summarizeImaginePool 委托账号服务做池统计；服务降级返回 Unknown=1 的
+// 空快照时不会触发快断（快断是增强，不是正确性依赖）。
+func (s *Service) summarizeImaginePool(ctx context.Context) (poolQuotaStats, error) {
+	stats, err := s.accounts.SummarizeWebImaginePool(ctx, poolQuotaStaleAfter, time.Now().UTC())
+	if err != nil {
+		return poolQuotaStats{}, err
+	}
+	return poolQuotaStats{
+		Total: stats.Total, FreshAvailable: stats.FreshAvailable,
+		ExhaustedKnown: stats.ExhaustedKnown, Unknown: stats.Unknown,
+		EarliestReset: stats.EarliestReset,
+	}, nil
+}
+
+// errMediaPoolQuotaExhausted 受理路径快断错误：429 + pool_quota_exhausted + ETA。
+var errMediaPoolQuotaExhausted = errors.New("额度池等待重置")
+
+type MediaPoolQuotaError struct {
+	EarliestReset time.Time
+}
+
+func (e *MediaPoolQuotaError) Error() string {
+	eta := e.EarliestReset.UTC().Format(time.RFC3339)
+	return fmt.Sprintf("上游视频/图像额度池当前无可用账号，最早恢复时间 %s", eta)
+}
+
+func (e *MediaPoolQuotaError) HTTPStatusCode() int { return http.StatusTooManyRequests }
+
+// guardMediaPoolQuota 在受理媒体任务前执行全池快断。返回非 nil 错误时调用方
+// 应立即拒绝任务，零上游调用。unknown>0 时不快断：尊重"以真实请求为准"的
+// 复盘教训，把不确定交给探测层。
+func (s *Service) guardMediaPoolQuota(ctx context.Context) error {
+	if !s.poolQuotaFailFast.Load() {
+		return nil
+	}
+	stats, err := s.poolQuotaSnapshot(ctx)
+	if err != nil {
+		// 统计失败不阻断受理：这是优化闸门，不是配额事实来源。
+		return nil
+	}
+	if stats.FreshAvailable > 0 || stats.Unknown > 0 {
+		return nil
+	}
+	if stats.EarliestReset != nil {
+		return &MediaPoolQuotaError{EarliestReset: *stats.EarliestReset}
+	}
+	return errMediaPoolQuotaExhausted
+}
+
+// UpdatePoolQuotaFailFast toggles the accept-time pool quota fail-fast gate.
+func (s *Service) UpdatePoolQuotaFailFast(enabled bool) {
+	s.poolQuotaFailFast.Store(enabled)
+}
+
+// UpdateVideoProbeBudget configures the per-job pre-create quota probe skip budget.
+func (s *Service) UpdateVideoProbeBudget(budget int) {
+	if budget <= 0 {
+		budget = videoProbeBudget
+	}
+	s.videoProbeBudget.Store(int64(budget))
+}
+
+func (s *Service) videoProbeBudgetLimit() int {
+	value := int(s.videoProbeBudget.Load())
+	if value <= 0 {
+		return videoProbeBudget
+	}
+	return value
 }
 
 // UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。

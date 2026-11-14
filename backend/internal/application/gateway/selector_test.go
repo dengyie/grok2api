@@ -1259,7 +1259,7 @@ func TestCandidateQuotaRankClassifiesSnapshots(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		candidate := account.RoutingCandidate{Credential: account.Credential{ID: 1}, QuotaWindow: testCase.window}
-		if got := candidateQuotaRank(candidate, now); got != testCase.want {
+		if got := candidateQuotaRank(candidate, now, 24*time.Hour); got != testCase.want {
 			t.Fatalf("%s: rank = %d, want %d", testCase.name, got, testCase.want)
 		}
 	}

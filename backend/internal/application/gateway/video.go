@@ -152,6 +152,15 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, ErrModelNotFound
 	}
+	// 全池额度快断（11-14 事故结构修复第 3 层）：没有任何 fresh-available 且
+	// 没有 unknown 账号时，秒级 429 并给出恢复 ETA，不再逐账号烧 video_create。
+	if guardErr := s.guardMediaPoolQuota(ctx); guardErr != nil {
+		return media.Job{}, &UpstreamFailure{
+			HTTPStatus: http.StatusTooManyRequests, Code: "pool_quota_exhausted",
+			PublicMessage: guardErr.Error(), QuotaExhausted: true,
+			Fingerprint: "pool_quota_exhausted", Cause: guardErr,
+		}
+	}
 	routes, err = routesForVideoOperation(routes, operation)
 	if err != nil {
 		return media.Job{}, err
@@ -696,6 +705,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	var lastErr error
 	retryStartedAt := time.Now()
 	var failureStreak videoFailureStreakTracker
+	probeSkips := 0
 
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		attemptStarted := time.Now()
@@ -775,6 +785,29 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			return
 		}
 		excluded[lease.Credential.ID] = true
+		// 先看额度再发视频请求（11-14 事故的结构性修复）：lease 挂着探活标记
+		// 或快照不可信时，先用一次分组额度探测确认 remaining，再决定是否碰
+		// video 端点。探测成本（一次上游额度查询）远低于一次必然 429 的
+		// video_create，且不给视频限流器制造压力。
+		if lease.QuotaProbe || videoQuotaSnapshotUntrusted(lease) {
+			probeOK, probeErr := s.probeVideoAccountQuota(ctx, lease, quotaRefreshGroup, quotaMode)
+			if probeErr != nil || !probeOK {
+				probeSkips++
+				if probeSkips >= s.videoProbeBudgetLimit() {
+					s.logger.Warn("video_job_probe_budget_exhausted", "job_id", job.ID,
+						"attempts", attempt, "probe_skips", probeSkips, "last_probe_error", probeErrString(probeErr))
+					lastErr = fmt.Errorf("%w: 连续 %d 个账号额度探测未通过", ErrNoAvailableAccount, probeSkips)
+					s.failVideoJob(parent, job, "account_unavailable", lastErr, 0, failureAttempts.snapshot())
+					return
+				}
+				if attemptPolicy.hasNext(attempt) {
+					continue
+				}
+				lastErr = probeErrStringOr(probeErr, "账号额度探测未通过")
+				s.failVideoJob(parent, job, "account_unavailable", fmt.Errorf("%w: %v", ErrNoAvailableAccount, lastErr), 0, failureAttempts.snapshot())
+				return
+			}
+		}
 		credential, credErr := s.accounts.EnsureCredential(ctx, lease.Credential, false)
 		if credErr != nil {
 			failureAttempts.captureCredentialFailure(lease.Credential, attemptStarted, false, credErr)
@@ -961,6 +994,79 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	// 输入回收放在账号状态、计费和审计收尾之后，存储抖动不得延迟关键终态逻辑。
 	s.releaseVideoInputs(job)
+}
+
+// videoProbeBudget 默认单任务 create 前额度探测跳过上限：超过即判定账号池
+// 或出口整体不健康，与其继续在探测上消耗任务寿命不如直接失败让上游限流冷却。
+const videoProbeBudget = 8
+
+// videoQuotaSnapshotUntrusted 判断该 lease 的额度快照是否已失去指导意义：
+// 探测型 lease 由选号器在恢复窗口到期时发出，本身就代表"先确认再消费"；
+// stale 快照（候选层已降级为 unknown，但仍可能被 sticky/pinned 选中）同样
+// 不能直接拿去烧 video_create。
+func videoQuotaSnapshotUntrusted(lease *accountLease) bool {
+	if lease == nil || lease.QuotaMode == "" {
+		return false
+	}
+	window := lease.routingCandidateQuotaWindow()
+	if window == nil || window.Source != account.QuotaSourceUpstream {
+		return false
+	}
+	now := time.Now().UTC()
+	if window.ResetAt != nil && !now.Before(*window.ResetAt) {
+		return true
+	}
+	if window.SyncedAt != nil && now.Sub(*window.SyncedAt) > quotaSnapshotStaleAfter {
+		return true
+	}
+	return false
+}
+
+// probeVideoAccountQuota 在发 video_create 之前核实账号额度。复用
+// RefreshQuotaMode 的分组探测（web_imagine 一次上游调用取回整组产品窗口，
+// 已含 singleflight 去重）。返回 (false, nil) 表示确认耗尽；探测失败返回
+// error（同样按跳过处理，绝不带着未知额度去碰视频端点）。
+func (s *Service) probeVideoAccountQuota(ctx context.Context, lease *accountLease, quotaRefreshGroup, quotaMode string) (bool, error) {
+	mode := quotaMode
+	if quotaRefreshGroup != "" {
+		mode = quotaRefreshGroup
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	window, err := s.accounts.RefreshQuotaMode(probeCtx, lease.Credential.ID, mode)
+	if err != nil {
+		s.logger.Warn("video_quota_probe_failed", "job_id", "", "account_id", lease.Credential.ID, "mode", mode, "error", err)
+		return false, err
+	}
+	if window.Remaining <= 0 || window.UsagePercent >= 100 {
+		// 上游确认耗尽：标记窗口并调度恢复，之后选号器会自动跳过该账号。
+		resetAt := window.ResetAt
+		exhaustCtx, exhaustCancel := context.WithTimeout(context.Background(), accountStateWriteTimeout)
+		exhaustErr := s.accounts.ExhaustQuota(exhaustCtx, lease.Credential.ID, lease.QuotaMode, resetAt)
+		exhaustCancel()
+		if exhaustErr != nil {
+			s.logger.Warn("video_quota_probe_exhaust_write_failed", "account_id", lease.Credential.ID, "mode", lease.QuotaMode, "error", exhaustErr)
+		}
+		s.logger.Info("video_quota_probe_exhausted", "account_id", lease.Credential.ID, "mode", lease.QuotaMode)
+		return false, nil
+	}
+	s.logger.Info("video_quota_probe_available", "account_id", lease.Credential.ID, "mode", lease.QuotaMode, "remaining", window.Remaining)
+	return true, nil
+}
+
+// probeErrString / probeErrStringOr 仅服务于探测跳过时的日志与失败文案。
+func probeErrString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitizeDiagnosticText(err.Error(), 200)
+}
+
+func probeErrStringOr(err error, fallback string) error {
+	if err != nil {
+		return err
+	}
+	return errors.New(fallback)
 }
 
 func videoQuotaMode(providerValue account.Provider, catalogMode, resolution string) string {
